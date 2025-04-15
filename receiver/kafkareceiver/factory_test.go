@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package kafkareceiver
 
@@ -21,183 +10,118 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config/configtest"
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/kafka/configkafka"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkareceiver/internal/metadata"
 )
 
 func TestCreateDefaultConfig(t *testing.T) {
-	cfg := createDefaultConfig().(*Config)
+	cfg := createDefaultConfig()
 	assert.NotNil(t, cfg, "failed to create default config")
-	assert.NoError(t, configtest.CheckConfigStruct(cfg))
-	assert.Equal(t, []string{defaultBroker}, cfg.Brokers)
-	assert.Equal(t, defaultTopic, cfg.Topic)
-	assert.Equal(t, defaultGroupID, cfg.GroupID)
-	assert.Equal(t, defaultClientID, cfg.ClientID)
+	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
+	assert.Equal(t, configkafka.NewDefaultClientConfig(), cfg.ClientConfig)
+	assert.Equal(t, configkafka.NewDefaultConsumerConfig(), cfg.ConsumerConfig)
 }
 
-func TestCreateTracesReceiver(t *testing.T) {
-	cfg := createDefaultConfig().(*Config)
+func TestCreateTraces(t *testing.T) {
+	cfg := createDefaultConfig()
 	cfg.Brokers = []string{"invalid:9092"}
 	cfg.ProtocolVersion = "2.0.0"
-	f := kafkaReceiverFactory{tracesUnmarshalers: defaultTracesUnmarshalers()}
-	r, err := f.createTracesReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
-	// no available broker
-	require.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestCreateTracesReceiver_error(t *testing.T) {
-	cfg := createDefaultConfig().(*Config)
-	cfg.ProtocolVersion = "2.0.0"
-	// disable contacting broker at startup
-	cfg.Metadata.Full = false
-	f := kafkaReceiverFactory{tracesUnmarshalers: defaultTracesUnmarshalers()}
-	r, err := f.createTracesReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
+	r, err := createTracesReceiver(context.Background(), receivertest.NewNopSettings(metadata.Type), cfg, nil)
 	require.NoError(t, err)
-	assert.NotNil(t, r)
+	// no available broker
+	require.Error(t, r.Start(context.Background(), componenttest.NewNopHost()))
 }
 
 func TestWithTracesUnmarshalers(t *testing.T) {
-	unmarshaler := &customTracesUnmarshaler{}
-	f := NewFactory(WithTracesUnmarshalers(unmarshaler))
-	cfg := createDefaultConfig().(*Config)
-	// disable contacting broker
-	cfg.Metadata.Full = false
-	cfg.ProtocolVersion = "2.0.0"
+	f := NewFactory()
 
 	t.Run("custom_encoding", func(t *testing.T) {
-		cfg.Encoding = unmarshaler.Encoding()
-		receiver, err := f.CreateTracesReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
+		cfg := createDefaultConfig()
+		cfg.Traces.Encoding = "custom"
+		receiver, err := f.CreateTraces(context.Background(), receivertest.NewNopSettings(metadata.Type), cfg, nil)
+		tracesConsumer, ok := receiver.(*kafkaTracesConsumer)
+		require.True(t, ok)
+		require.Equal(t, "custom", tracesConsumer.config.Traces.Encoding)
 		require.NoError(t, err)
 		require.NotNil(t, receiver)
 	})
 	t.Run("default_encoding", func(t *testing.T) {
-		cfg.Encoding = defaultEncoding
-		receiver, err := f.CreateTracesReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
+		cfg := createDefaultConfig()
+		receiver, err := f.CreateTraces(context.Background(), receivertest.NewNopSettings(metadata.Type), cfg, nil)
+		tracesConsumer, ok := receiver.(*kafkaTracesConsumer)
+		require.True(t, ok)
+		require.Equal(t, defaultTracesEncoding, tracesConsumer.config.Traces.Encoding)
 		require.NoError(t, err)
 		assert.NotNil(t, receiver)
 	})
 }
 
-func TestCreateMetricsReceiver(t *testing.T) {
-	cfg := createDefaultConfig().(*Config)
+func TestCreateMetrics(t *testing.T) {
+	cfg := createDefaultConfig()
 	cfg.Brokers = []string{"invalid:9092"}
 	cfg.ProtocolVersion = "2.0.0"
-	f := kafkaReceiverFactory{metricsUnmarshalers: defaultMetricsUnmarshalers()}
-	r, err := f.createMetricsReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
-	// no available broker
-	require.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestCreateMetricsReceiver_error(t *testing.T) {
-	cfg := createDefaultConfig().(*Config)
-	cfg.ProtocolVersion = "2.0.0"
-	// disable contacting broker at startup
-	cfg.Metadata.Full = false
-	f := kafkaReceiverFactory{metricsUnmarshalers: defaultMetricsUnmarshalers()}
-	r, err := f.createMetricsReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
+	r, err := createMetricsReceiver(context.Background(), receivertest.NewNopSettings(metadata.Type), cfg, nil)
 	require.NoError(t, err)
-	assert.NotNil(t, r)
+	// no available broker
+	require.Error(t, r.Start(context.Background(), componenttest.NewNopHost()))
 }
 
 func TestWithMetricsUnmarshalers(t *testing.T) {
-	unmarshaler := &customMetricsUnmarshaler{}
-	f := NewFactory(WithMetricsUnmarshalers(unmarshaler))
-	cfg := createDefaultConfig().(*Config)
-	// disable contacting broker
-	cfg.Metadata.Full = false
-	cfg.ProtocolVersion = "2.0.0"
+	f := NewFactory()
 
 	t.Run("custom_encoding", func(t *testing.T) {
-		cfg.Encoding = unmarshaler.Encoding()
-		receiver, err := f.CreateMetricsReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
+		cfg := createDefaultConfig()
+		cfg.Metrics.Encoding = "custom"
+		receiver, err := f.CreateMetrics(context.Background(), receivertest.NewNopSettings(metadata.Type), cfg, nil)
+		metricsConsumer, ok := receiver.(*kafkaMetricsConsumer)
+		require.True(t, ok)
+		require.Equal(t, "custom", metricsConsumer.config.Metrics.Encoding)
 		require.NoError(t, err)
 		require.NotNil(t, receiver)
 	})
 	t.Run("default_encoding", func(t *testing.T) {
-		cfg.Encoding = defaultEncoding
-		receiver, err := f.CreateMetricsReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
+		cfg := createDefaultConfig()
+		receiver, err := f.CreateMetrics(context.Background(), receivertest.NewNopSettings(metadata.Type), cfg, nil)
+		metricsConsumer, ok := receiver.(*kafkaMetricsConsumer)
+		require.True(t, ok)
+		require.Equal(t, defaultMetricsEncoding, metricsConsumer.config.Metrics.Encoding)
 		require.NoError(t, err)
 		assert.NotNil(t, receiver)
 	})
 }
 
-func TestCreateLogsReceiver(t *testing.T) {
-	cfg := createDefaultConfig().(*Config)
+func TestCreateLogs(t *testing.T) {
+	cfg := createDefaultConfig()
 	cfg.Brokers = []string{"invalid:9092"}
 	cfg.ProtocolVersion = "2.0.0"
-	f := kafkaReceiverFactory{logsUnmarshalers: defaultLogsUnmarshalers()}
-	r, err := f.createLogsReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
-	// no available broker
-	require.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestCreateLogsReceiver_error(t *testing.T) {
-	cfg := createDefaultConfig().(*Config)
-	cfg.ProtocolVersion = "2.0.0"
-	// disable contacting broker at startup
-	cfg.Metadata.Full = false
-	f := kafkaReceiverFactory{logsUnmarshalers: defaultLogsUnmarshalers()}
-	r, err := f.createLogsReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
+	r, err := createLogsReceiver(context.Background(), receivertest.NewNopSettings(metadata.Type), cfg, nil)
 	require.NoError(t, err)
-	assert.NotNil(t, r)
+	// no available broker
+	require.Error(t, r.Start(context.Background(), componenttest.NewNopHost()))
 }
 
 func TestWithLogsUnmarshalers(t *testing.T) {
-	unmarshaler := &customLogsUnmarshaler{}
-	f := NewFactory(WithLogsUnmarshalers(unmarshaler))
-	cfg := createDefaultConfig().(*Config)
-	// disable contacting broker
-	cfg.Metadata.Full = false
-	cfg.ProtocolVersion = "2.0.0"
+	f := NewFactory()
 
 	t.Run("custom_encoding", func(t *testing.T) {
-		cfg.Encoding = unmarshaler.Encoding()
-		exporter, err := f.CreateLogsReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
+		cfg := createDefaultConfig()
+		cfg.Logs.Encoding = "custom"
+		receiver, err := f.CreateLogs(context.Background(), receivertest.NewNopSettings(metadata.Type), cfg, nil)
+		logsConsumer, ok := receiver.(*kafkaLogsConsumer)
+		require.True(t, ok)
+		require.Equal(t, "custom", logsConsumer.config.Logs.Encoding)
 		require.NoError(t, err)
-		require.NotNil(t, exporter)
+		require.NotNil(t, receiver)
 	})
 	t.Run("default_encoding", func(t *testing.T) {
-		cfg.Encoding = defaultEncoding
-		exporter, err := f.CreateLogsReceiver(context.Background(), componenttest.NewNopReceiverCreateSettings(), cfg, nil)
+		cfg := createDefaultConfig()
+		receiver, err := f.CreateLogs(context.Background(), receivertest.NewNopSettings(metadata.Type), cfg, nil)
+		logsConsumer, ok := receiver.(*kafkaLogsConsumer)
+		require.True(t, ok)
+		require.Equal(t, defaultLogsEncoding, logsConsumer.config.Logs.Encoding)
 		require.NoError(t, err)
-		assert.NotNil(t, exporter)
+		assert.NotNil(t, receiver)
 	})
-}
-
-type customTracesUnmarshaler struct {
-}
-
-type customMetricsUnmarshaler struct {
-}
-
-type customLogsUnmarshaler struct {
-}
-
-var _ TracesUnmarshaler = (*customTracesUnmarshaler)(nil)
-
-func (c customTracesUnmarshaler) Unmarshal([]byte) (pdata.Traces, error) {
-	panic("implement me")
-}
-
-func (c customTracesUnmarshaler) Encoding() string {
-	return "custom"
-}
-
-func (c customMetricsUnmarshaler) Unmarshal([]byte) (pdata.Metrics, error) {
-	panic("implement me")
-}
-
-func (c customMetricsUnmarshaler) Encoding() string {
-	return "custom"
-}
-
-func (c customLogsUnmarshaler) Unmarshal([]byte) (pdata.Logs, error) {
-	panic("implement me")
-}
-
-func (c customLogsUnmarshaler) Encoding() string {
-	return "custom"
 }

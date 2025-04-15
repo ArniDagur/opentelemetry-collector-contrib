@@ -1,20 +1,10 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package errctx
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -22,12 +12,12 @@ import (
 )
 
 func TestWithValue(t *testing.T) {
-	assert.Nil(t, WithValue(nil, "a", "b"))
+	assert.NoError(t, WithValue(nil, "a", "b"))
 	assert.Panics(t, func() {
-		WithValue(fmt.Errorf("base"), "", nil)
+		_ = WithValue(errors.New("base"), "", nil)
 	})
 
-	e1 := WithValue(fmt.Errorf("base"), "a", "b")
+	e1 := WithValue(errors.New("base"), "a", "b")
 	assert.Equal(t, "base a=b", e1.Error())
 	v1, ok := ValueFrom(e1, "a")
 	assert.True(t, ok)
@@ -46,12 +36,12 @@ func TestWithValue(t *testing.T) {
 }
 
 func TestWithValues(t *testing.T) {
-	assert.Nil(t, WithValues(nil, map[string]interface{}{"a": "b"}))
+	assert.NoError(t, WithValues(nil, map[string]any{"a": "b"}))
 	assert.Panics(t, func() {
-		WithValues(fmt.Errorf("base"), map[string]interface{}{"": "123"})
+		_ = WithValues(errors.New("base"), map[string]any{"": "123"})
 	})
 
-	e1 := WithValues(fmt.Errorf("base"), map[string]interface{}{"a": "b", "c": 123})
+	e1 := WithValues(errors.New("base"), map[string]any{"a": "b", "c": 123})
 	// NOTE: we sort the key in the impl so the test is not flaky
 	assert.Equal(t, "base a=b c=123", e1.Error())
 	v1, ok := ValueFrom(e1, "a")
@@ -70,7 +60,7 @@ func TestValueFrom(t *testing.T) {
 
 	// Chained with value in the middle
 	t.Run("chained", func(t *testing.T) {
-		e1 := fmt.Errorf("base")
+		e1 := errors.New("base")
 		e2 := WithValue(e1, "a", "b")
 		e3 := fmt.Errorf("l2 %w", e2)
 
@@ -81,7 +71,7 @@ func TestValueFrom(t *testing.T) {
 
 	// When there is duplication in the chain, the first one comes out got picked up.
 	t.Run("duplication", func(t *testing.T) {
-		e1 := fmt.Errorf("base")
+		e1 := errors.New("base")
 		e2 := WithValue(e1, "a", "e2")
 		e3 := fmt.Errorf("e3 %w", e2)
 		e4 := WithValue(e3, "a", "e4")
@@ -94,5 +84,4 @@ func TestValueFrom(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, "e2", v)
 	})
-
 }

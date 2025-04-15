@@ -1,22 +1,13 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package observer
 
 import (
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEndpointEnv(t *testing.T) {
@@ -24,7 +15,6 @@ func TestEndpointEnv(t *testing.T) {
 		name     string
 		endpoint Endpoint
 		want     EndpointEnv
-		wantErr  bool
 	}{
 		{
 			name: "Pod",
@@ -46,6 +36,7 @@ func TestEndpointEnv(t *testing.T) {
 			want: EndpointEnv{
 				"type":     "pod",
 				"endpoint": "192.68.73.2",
+				"id":       "pod_id",
 				"name":     "pod_name",
 				"labels": map[string]string{
 					"label_key": "label_val",
@@ -55,11 +46,11 @@ func TestEndpointEnv(t *testing.T) {
 				},
 				"uid":       "pod-uid",
 				"namespace": "pod-namespace",
+				"host":      "192.68.73.2",
 			},
-			wantErr: false,
 		},
 		{
-			name: "K8s port",
+			name: "K8s pod port",
 			endpoint: Endpoint{
 				ID:     EndpointID("port_id"),
 				Target: "192.68.73.2",
@@ -83,6 +74,7 @@ func TestEndpointEnv(t *testing.T) {
 			want: EndpointEnv{
 				"type":     "port",
 				"endpoint": "192.68.73.2",
+				"id":       "port_id",
 				"name":     "port_name",
 				"port":     uint16(2379),
 				"pod": EndpointEnv{
@@ -97,8 +89,45 @@ func TestEndpointEnv(t *testing.T) {
 					"namespace": "pod-namespace",
 				},
 				"transport": ProtocolTCP,
+				"host":      "192.68.73.2",
 			},
-			wantErr: false,
+		},
+		{
+			name: "Service",
+			endpoint: Endpoint{
+				ID:     EndpointID("service_id"),
+				Target: "service.namespace",
+				Details: &K8sService{
+					Name: "service_name",
+					UID:  "service-uid",
+					Labels: map[string]string{
+						"label_key": "label_val",
+					},
+					Annotations: map[string]string{
+						"annotation_1": "value_1",
+					},
+					Namespace:   "service-namespace",
+					ServiceType: "LoadBalancer",
+					ClusterIP:   "192.68.73.2",
+				},
+			},
+			want: EndpointEnv{
+				"type":     "k8s.service",
+				"endpoint": "service.namespace",
+				"id":       "service_id",
+				"name":     "service_name",
+				"labels": map[string]string{
+					"label_key": "label_val",
+				},
+				"annotations": map[string]string{
+					"annotation_1": "value_1",
+				},
+				"uid":          "service-uid",
+				"namespace":    "service-namespace",
+				"cluster_ip":   "192.68.73.2",
+				"service_type": "LoadBalancer",
+				"host":         "service.namespace",
+			},
 		},
 		{
 			name: "Host port",
@@ -116,13 +145,14 @@ func TestEndpointEnv(t *testing.T) {
 			want: EndpointEnv{
 				"type":         "hostport",
 				"endpoint":     "127.0.0.1",
+				"id":           "port_id",
 				"process_name": "process_name",
 				"command":      "./cmd --config config.yaml",
 				"is_ipv6":      true,
 				"port":         uint16(2379),
 				"transport":    ProtocolUDP,
+				"host":         "127.0.0.1",
 			},
-			wantErr: false,
 		},
 		{
 			name: "Container",
@@ -146,6 +176,7 @@ func TestEndpointEnv(t *testing.T) {
 			},
 			want: EndpointEnv{
 				"type":           "container",
+				"id":             "container_endpoint_id",
 				"name":           "otel-collector",
 				"image":          "otel-collector-image",
 				"tag":            "1.0.0",
@@ -160,7 +191,6 @@ func TestEndpointEnv(t *testing.T) {
 				},
 				"endpoint": "127.0.0.1",
 			},
-			wantErr: false,
 		},
 		{
 			name: "Kubernetes Node",
@@ -186,6 +216,7 @@ func TestEndpointEnv(t *testing.T) {
 			},
 			want: EndpointEnv{
 				"type":                  "k8s.node",
+				"id":                    "k8s_node_endpoint_id",
 				"name":                  "a-k8s-node",
 				"uid":                   "a-k8s-node-uid",
 				"hostname":              "a-k8s-node-hostname",
@@ -201,20 +232,76 @@ func TestEndpointEnv(t *testing.T) {
 				"labels": map[string]string{
 					"label_key": "label_val",
 				},
+				"host": "127.0.0.1",
+				"port": "1234",
 			},
-			wantErr: false,
+		},
+		{
+			// This is an invalid test case, to ensure "port" keeps the original value and
+			// isn't overwritten by a port parsed from the "Target". The two ports shouldn't mismatch
+			// if they're exposed in both places.
+			name: "K8s pod port - conflicting ports",
+			endpoint: Endpoint{
+				ID:     EndpointID("port_id"),
+				Target: "192.68.73.2:4321",
+				Details: &Port{
+					Name: "port_name",
+					Pod: Pod{
+						Name: "pod_name",
+						Labels: map[string]string{
+							"label_key": "label_val",
+						},
+						Annotations: map[string]string{
+							"annotation_1": "value_1",
+						},
+						Namespace: "pod-namespace",
+						UID:       "pod-uid",
+					},
+					Port:      2379,
+					Transport: ProtocolTCP,
+				},
+			},
+			want: EndpointEnv{
+				"type":     "port",
+				"endpoint": "192.68.73.2:4321",
+				"id":       "port_id",
+				"name":     "port_name",
+				"port":     uint16(2379),
+				"pod": EndpointEnv{
+					"name": "pod_name",
+					"labels": map[string]string{
+						"label_key": "label_val",
+					},
+					"annotations": map[string]string{
+						"annotation_1": "value_1",
+					},
+					"uid":       "pod-uid",
+					"namespace": "pod-namespace",
+				},
+				"transport": ProtocolTCP,
+				"host":      "192.68.73.2",
+			},
+		},
+		{
+			name: "Kafka topic",
+			endpoint: Endpoint{
+				ID:      EndpointID("topic1"),
+				Target:  "topic1",
+				Details: &KafkaTopic{},
+			},
+			want: EndpointEnv{
+				"id":       "topic1",
+				"type":     "kafka.topics",
+				"host":     "topic1",
+				"endpoint": "topic1",
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := tt.endpoint.Env()
-			if (err != nil) != tt.wantErr {
-				t.Errorf("Env() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("Env() got = %v, want %v", got, tt.want)
-			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

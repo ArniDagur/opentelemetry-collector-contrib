@@ -1,31 +1,21 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package mongodbreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/mongodbreceiver"
 
 import (
 	"context"
-	"io/ioutil"
+	"errors"
+	"os"
 	"testing"
 
 	"github.com/hashicorp/go-version"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo/integration/mtest"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/drivertest"
 	"go.uber.org/zap"
 )
 
@@ -34,8 +24,13 @@ import (
 // while also testing with exclusively mtest.
 type fakeClient struct{ mock.Mock }
 
-func (fc *fakeClient) ListDatabaseNames(ctx context.Context, filters interface{}, opts ...*options.ListDatabasesOptions) ([]string, error) {
+func (fc *fakeClient) ListDatabaseNames(ctx context.Context, filters any, opts ...options.Lister[options.ListDatabasesOptions]) ([]string, error) {
 	args := fc.Called(ctx, filters, opts)
+	return args.Get(0).([]string), args.Error(1)
+}
+
+func (fc *fakeClient) ListCollectionNames(ctx context.Context, dbName string) ([]string, error) {
+	args := fc.Called(ctx, dbName)
 	return args.Get(0).([]string), args.Error(1)
 }
 
@@ -43,6 +38,7 @@ func (fc *fakeClient) Disconnect(ctx context.Context) error {
 	args := fc.Called(ctx)
 	return args.Error(0)
 }
+
 func (fc *fakeClient) Connect(ctx context.Context) error {
 	args := fc.Called(ctx)
 	return args.Error(0)
@@ -53,42 +49,71 @@ func (fc *fakeClient) GetVersion(ctx context.Context) (*version.Version, error) 
 	return args.Get(0).(*version.Version), args.Error(1)
 }
 
-func (fc *fakeClient) ServerStatus(ctx context.Context, DBName string) (bson.M, error) {
-	args := fc.Called(ctx, DBName)
+func (fc *fakeClient) ServerStatus(ctx context.Context, dbName string) (bson.M, error) {
+	args := fc.Called(ctx, dbName)
 	return args.Get(0).(bson.M), args.Error(1)
 }
 
-func (fc *fakeClient) DBStats(ctx context.Context, DBName string) (bson.M, error) {
-	args := fc.Called(ctx, DBName)
+func (fc *fakeClient) DBStats(ctx context.Context, dbName string) (bson.M, error) {
+	args := fc.Called(ctx, dbName)
 	return args.Get(0).(bson.M), args.Error(1)
+}
+
+func (fc *fakeClient) TopStats(ctx context.Context) (bson.M, error) {
+	args := fc.Called(ctx)
+	return args.Get(0).(bson.M), args.Error(1)
+}
+
+func (fc *fakeClient) IndexStats(ctx context.Context, dbName, collectionName string) ([]bson.M, error) {
+	args := fc.Called(ctx, dbName, collectionName)
+	return args.Get(0).([]bson.M), args.Error(1)
+}
+
+func (fc *fakeClient) RunCommand(ctx context.Context, db string, command bson.M) (bson.M, error) {
+	args := fc.Called(ctx, db, command)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+
+	result, ok := args.Get(0).(bson.M)
+	if !ok {
+		err := errors.New("mock returned invalid type")
+		zap.L().Error("type assertion failed",
+			zap.String("expected", "bson.M"))
+		return nil, err
+	}
+
+	return result, args.Error(1)
 }
 
 func TestListDatabaseNames(t *testing.T) {
-	mont := mtest.New(t, mtest.NewOptions().ClientType(mtest.Mock))
-	defer mont.Close()
-
-	mont.Run("list database names", func(mt *mtest.T) {
-		// mocking out a listdatabase call
-		mt.AddMockResponses(mtest.CreateSuccessResponse(
-			primitive.E{
-				Key: "databases",
-				Value: []struct {
-					Name string `bson:"name,omitempty"`
-				}{
-					{
-						Name: "admin",
-					},
-				},
-			}))
-		driver := mt.Client
-		client := &mongodbClient{
-			Client: driver,
-		}
-		dbNames, err := client.ListDatabaseNames(context.Background(), bson.D{})
-		require.NoError(t, err)
-		require.Equal(t, dbNames[0], "admin")
+	mont := drivertest.NewMockDeployment()
+	mont.AddResponses(bson.D{
+		bson.E{
+			Key:   "ok",
+			Value: 1,
+		},
+		bson.E{
+			Key: "databases",
+			Value: []struct {
+				Name string `bson:"name,omitempty"`
+			}{
+				{Name: "admin"},
+			},
+		},
 	})
+	opts := options.Client()
+	//nolint:staticcheck // Using deprecated Deployment field for testing purposes
+	opts.Deployment = mont
+	c, err := mongo.Connect(opts)
+	require.NoError(t, err)
 
+	client := &mongodbClient{
+		Client: c,
+	}
+	dbNames, err := client.ListDatabaseNames(context.Background(), bson.D{})
+	require.NoError(t, err)
+	require.Equal(t, "admin", dbNames[0])
 }
 
 type commandString = string
@@ -96,15 +121,15 @@ type commandString = string
 const (
 	dbStatsType      commandString = "dbStats"
 	serverStatusType commandString = "serverStatus"
+	topType          commandString = "top"
 )
 
 func TestRunCommands(t *testing.T) {
-	mont := mtest.New(t, mtest.NewOptions().ClientType(mtest.Mock))
-	defer mont.Close()
-
 	loadedDbStats, err := loadDBStats()
 	require.NoError(t, err)
 	loadedServerStatus, err := loadServerStatus()
+	require.NoError(t, err)
+	loadedTop, err := loadTop()
 	require.NoError(t, err)
 
 	testCases := []struct {
@@ -126,99 +151,123 @@ func TestRunCommands(t *testing.T) {
 			cmd:      serverStatusType,
 			response: loadedServerStatus,
 			validate: func(t *testing.T, m bson.M) {
-				require.Equal(t, int32(0), m["mem"].(bson.M)["mapped"])
+				mem, err := dig(m, []string{"mem", "mapped"})
+				require.NoError(t, err)
+				require.Equal(t, int32(0), mem)
+			},
+		},
+		{
+			desc:     "top success",
+			cmd:      topType,
+			response: loadedTop,
+			validate: func(t *testing.T, m bson.M) {
+				commands, err := dig(m, []string{"totals", "local.oplog.rs", "commands", "time"})
+				require.NoError(t, err)
+				require.Equal(t, int32(540), commands)
 			},
 		},
 	}
 
 	for _, tc := range testCases {
-		mont.Run(tc.desc, func(mt *mtest.T) {
-			mt.AddMockResponses(tc.response)
-			driver := mt.Client
-			client := mongodbClient{
-				Client: driver,
-				logger: zap.NewNop(),
-			}
-			var result bson.M
-			if tc.cmd == serverStatusType {
-				result, err = client.ServerStatus(context.Background(), "test")
-			} else {
-				result, err = client.DBStats(context.Background(), "test")
-			}
-			require.NoError(t, err)
-			if tc.validate != nil {
-				tc.validate(t, result)
-			}
-		})
+		mont := drivertest.NewMockDeployment()
+		mont.AddResponses(tc.response)
+		opts := options.Client()
+		//nolint:staticcheck // Using deprecated Deployment field for testing purposes
+		opts.Deployment = mont
+		c, err := mongo.Connect(opts)
+		require.NoError(t, err)
+
+		client := &mongodbClient{
+			Client: c,
+			logger: zap.NewNop(),
+		}
+
+		var result bson.M
+		switch tc.cmd {
+		case serverStatusType:
+			result, err = client.ServerStatus(context.Background(), "test")
+		case dbStatsType:
+			result, err = client.DBStats(context.Background(), "test")
+		case topType:
+			result, err = client.TopStats(context.Background())
+		}
+		require.NoError(t, err)
+		if tc.validate != nil {
+			tc.validate(t, result)
+		}
 	}
 }
 
 func TestGetVersion(t *testing.T) {
-	mont := mtest.New(t, mtest.NewOptions().ClientType(mtest.Mock))
-	defer mont.Close()
+	mont := drivertest.NewMockDeployment()
 
 	buildInfo, err := loadBuildInfo()
 	require.NoError(t, err)
 
-	mont.Run("test connection", func(mt *mtest.T) {
-		mt.AddMockResponses(
-			// retrieving build info
-			buildInfo,
-		)
+	mont.AddResponses(buildInfo)
 
-		driver := mt.Client
-		client := mongodbClient{
-			Client: driver,
-			logger: zap.NewNop(),
-		}
+	opts := options.Client()
+	//nolint:staticcheck // Using deprecated Deployment field for testing purposes
+	opts.Deployment = mont
+	c, err := mongo.Connect(opts)
+	require.NoError(t, err)
 
-		version, err := client.GetVersion(context.TODO())
-		require.NoError(t, err)
-		require.Equal(t, "4.4.10", version.String())
-	})
+	client := mongodbClient{
+		Client: c,
+		logger: zap.NewNop(),
+	}
+
+	version, err := client.GetVersion(context.TODO())
+	require.NoError(t, err)
+	require.Equal(t, "4.4.10", version.String())
 }
 
 func TestGetVersionFailures(t *testing.T) {
-	mont := mtest.New(t, mtest.NewOptions().ClientType(mtest.Mock))
-	defer mont.Close()
+	mt := drivertest.NewMockDeployment()
 
 	malformedBuildInfo := bson.D{
-		primitive.E{Key: "ok", Value: 1},
-		primitive.E{Key: "version", Value: 1},
+		bson.E{Key: "ok", Value: 1},
+		bson.E{Key: "version", Value: 1},
 	}
 
 	testCases := []struct {
 		desc         string
-		responses    []primitive.D
+		responses    []bson.D
 		partialError string
 	}{
 		{
-			desc:         "Unable to run buildInfo",
-			responses:    []primitive.D{mtest.CreateCommandErrorResponse(mtest.CommandError{})},
+			desc: "Unable to run buildInfo",
+			responses: []bson.D{{
+				bson.E{Key: "ok", Value: 0},
+				bson.E{Key: "code", Value: mongo.CommandError{}.Code},
+				bson.E{Key: "errmsg", Value: mongo.CommandError{}.Message},
+				bson.E{Key: "codeName", Value: mongo.CommandError{}.Name},
+			}},
 			partialError: "unable to get build info",
 		},
 		{
 			desc:         "unable to parse version",
-			responses:    []primitive.D{mtest.CreateSuccessResponse(), malformedBuildInfo},
+			responses:    []bson.D{malformedBuildInfo},
 			partialError: "unable to parse mongo version from server",
 		},
 	}
 
 	for _, tc := range testCases {
-		mont.Run(tc.desc, func(mt *mtest.T) {
-			mt.AddMockResponses(tc.responses...)
-			driver := mt.Client
-			client := mongodbClient{
-				Client: driver,
-				logger: zap.NewNop(),
-			}
+		mt.AddResponses(tc.responses...)
+		opts := options.Client()
+		//nolint:staticcheck // Using deprecated Deployment field for testing purposes
+		opts.Deployment = mt
+		c, err := mongo.Connect(opts)
+		require.NoError(t, err)
 
-			_, err := client.GetVersion(context.TODO())
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tc.partialError)
-		})
+		client := mongodbClient{
+			Client: c,
+			logger: zap.NewNop(),
+		}
+
+		_, err = client.GetVersion(context.Background())
+		require.ErrorContains(t, err, tc.partialError)
 	}
-
 }
 
 func loadDBStats() (bson.D, error) {
@@ -237,6 +286,34 @@ func loadServerStatusAsMap() (bson.M, error) {
 	return loadTestFileAsMap("./testdata/serverStatus.json")
 }
 
+func loadTop() (bson.D, error) {
+	return loadTestFile("./testdata/top.json")
+}
+
+func loadTopAsMap() (bson.M, error) {
+	return loadTestFileAsMap("./testdata/top.json")
+}
+
+func loadIndexStatsAsMap(collectionName string) ([]bson.M, error) {
+	var indexStats []bson.M
+	switch collectionName {
+	case "products":
+		indexStats0, _ := loadTestFileAsMap("./testdata/productsIndexStats0.json")
+		indexStats = append(indexStats, indexStats0)
+	case "orders":
+		indexStats0, _ := loadTestFileAsMap("./testdata/ordersIndexStats0.json")
+		indexStats1, _ := loadTestFileAsMap("./testdata/ordersIndexStats1.json")
+		indexStats2, _ := loadTestFileAsMap("./testdata/ordersIndexStats2.json")
+		indexStats = append(indexStats, indexStats0, indexStats1, indexStats2)
+	case "error":
+		indexStatsError, _ := loadTestFileAsMap("./testdata/indexStatsError.json")
+		indexStats = append(indexStats, indexStatsError)
+	default:
+		return nil, errors.New("failed to load index stats from an unknown collection name")
+	}
+	return indexStats, nil
+}
+
 func loadBuildInfo() (bson.D, error) {
 	return loadTestFile("./testdata/buildInfo.json")
 }
@@ -245,9 +322,13 @@ func loadAdminStatusAsMap() (bson.M, error) {
 	return loadTestFileAsMap("./testdata/admin.json")
 }
 
+func loadOnlyStorageEngineAsMap() (bson.M, error) {
+	return loadTestFileAsMap("./testdata/only_storage_engine.json")
+}
+
 func loadTestFile(filePath string) (bson.D, error) {
 	var doc bson.D
-	testFile, err := ioutil.ReadFile(filePath)
+	testFile, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +341,7 @@ func loadTestFile(filePath string) (bson.D, error) {
 
 func loadTestFileAsMap(filePath string) (bson.M, error) {
 	var doc bson.M
-	testFile, err := ioutil.ReadFile(filePath)
+	testFile, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
 	}

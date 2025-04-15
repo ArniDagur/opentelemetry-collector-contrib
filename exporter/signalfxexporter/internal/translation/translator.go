@@ -1,16 +1,5 @@
-// Copyright 2019, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package translation // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/signalfxexporter/internal/translation"
 
@@ -57,7 +46,7 @@ const (
 
 	// ActionCopyMetrics copies metrics using Rule.Mapping.
 	// Rule.DimensionKey and Rule.DimensionValues can be used to filter datapoints that must be copied,
-	// if these fields are set, only metics having a dimension with key == Rule.DimensionKey and
+	// if these fields are set, only metrics having a dimension with key == Rule.DimensionKey and
 	// value in Rule.DimensionValues will be copied.
 	ActionCopyMetrics Action = "copy_metrics"
 
@@ -188,7 +177,7 @@ type Rule struct {
 	// DimensionKey is used by "split_metric" translation rule action to specify dimension key
 	// that will be used to translate the metric datapoints. Datapoints that don't have
 	// the specified dimension key will not be translated.
-	// DimensionKey is also used by "copy_metrics" for filterring.
+	// DimensionKey is also used by "copy_metrics" for filtering.
 	DimensionKey string `mapstructure:"dimension_key"`
 
 	// DimensionValues is used by "copy_metrics" to filter out datapoints with dimensions values
@@ -237,7 +226,7 @@ type MetricTranslator struct {
 	deltaTranslator *deltaTranslator
 }
 
-func NewMetricTranslator(rules []Rule, ttl int64) (*MetricTranslator, error) {
+func NewMetricTranslator(rules []Rule, ttl int64, done chan struct{}) (*MetricTranslator, error) {
 	err := validateTranslationRules(rules)
 	if err != nil {
 		return nil, err
@@ -251,7 +240,7 @@ func NewMetricTranslator(rules []Rule, ttl int64) (*MetricTranslator, error) {
 	return &MetricTranslator{
 		rules:           rules,
 		dimensionsMap:   createDimensionsMap(rules),
-		deltaTranslator: newDeltaTranslator(ttl),
+		deltaTranslator: newDeltaTranslator(ttl, done),
 	}, nil
 }
 
@@ -402,6 +391,12 @@ func getMetricNamesAsSlice(metricName string, metricNames map[string]bool) []str
 	return out
 }
 
+func (mp *MetricTranslator) Start() {
+	if mp.deltaTranslator != nil {
+		mp.deltaTranslator.start()
+	}
+}
+
 // TranslateDataPoints transforms datapoints to a format compatible with signalfx backend
 // sfxDataPoints represents one metric converted to signalfx protobuf datapoints
 func (mp *MetricTranslator) TranslateDataPoints(logger *zap.Logger, sfxDataPoints []*sfxpb.DataPoint) []*sfxpb.DataPoint {
@@ -435,7 +430,6 @@ func (mp *MetricTranslator) TranslateDataPoints(logger *zap.Logger, sfxDataPoint
 						for _, d := range dp.Dimensions {
 							if k, ok := tr.CopyDimensions[d.Key]; ok {
 								dp.Dimensions = append(dp.Dimensions, &sfxpb.Dimension{Key: k, Value: d.Value})
-
 							}
 						}
 					}
@@ -449,7 +443,7 @@ func (mp *MetricTranslator) TranslateDataPoints(logger *zap.Logger, sfxDataPoint
 				if multiplier, ok := tr.ScaleFactorsInt[dp.Metric]; ok {
 					v := dp.GetValue().IntValue
 					if v != nil {
-						*v = *v * multiplier
+						*v *= multiplier
 					}
 				}
 			}
@@ -458,7 +452,7 @@ func (mp *MetricTranslator) TranslateDataPoints(logger *zap.Logger, sfxDataPoint
 				if divisor, ok := tr.ScaleFactorsInt[dp.Metric]; ok {
 					v := dp.GetValue().IntValue
 					if v != nil {
-						*v = *v / divisor
+						*v /= divisor
 					}
 				}
 			}
@@ -467,7 +461,7 @@ func (mp *MetricTranslator) TranslateDataPoints(logger *zap.Logger, sfxDataPoint
 				if multiplier, ok := tr.ScaleFactorsFloat[dp.Metric]; ok {
 					v := dp.GetValue().DoubleValue
 					if v != nil {
-						*v = *v * multiplier
+						*v *= multiplier
 					}
 				}
 			}
@@ -523,7 +517,8 @@ func (mp *MetricTranslator) TranslateDataPoints(logger *zap.Logger, sfxDataPoint
 				}
 			}
 			aggregatedDps := aggregateDatapoints(dpsToAggregate, tr.WithoutDimensions, tr.AggregationMethod)
-			processedDataPoints = append(otherDps, aggregatedDps...)
+			processedDataPoints = otherDps
+			processedDataPoints = append(processedDataPoints, aggregatedDps...)
 
 		case ActionDropMetrics:
 			resultSliceLen := 0
@@ -550,12 +545,19 @@ func (mp *MetricTranslator) TranslateDataPoints(logger *zap.Logger, sfxDataPoint
 	return processedDataPoints
 }
 
+func (mp *MetricTranslator) Shutdown() {
+	if mp.deltaTranslator != nil {
+		mp.deltaTranslator.shutdown()
+	}
+}
+
 func calcNewMetricInputPairs(processedDataPoints []*sfxpb.DataPoint, tr Rule) [][2]*sfxpb.DataPoint {
 	var operand1Pts, operand2Pts []*sfxpb.DataPoint
 	for _, dp := range processedDataPoints {
-		if dp.Metric == tr.Operand1Metric {
+		switch dp.Metric {
+		case tr.Operand1Metric:
 			operand1Pts = append(operand1Pts, dp)
-		} else if dp.Metric == tr.Operand2Metric {
+		case tr.Operand2Metric:
 			operand2Pts = append(operand2Pts, dp)
 		}
 	}
@@ -621,7 +623,10 @@ func calculateNewMetric(
 	}
 
 	if tr.Operator == MetricOperatorDivision && *v2 == 0 {
-		logger.Warn(
+		// We can get here if, for example, in the denominator we get multiple
+		// datapoints that have the same counter value, which will yield a delta of
+		// zero.
+		logger.Debug(
 			"calculate_new_metric: attempt to divide by zero, skipping",
 			zap.String("tr.Operand2Metric", tr.Operand2Metric),
 			zap.String("tr.MetricName", tr.MetricName),
@@ -649,11 +654,12 @@ func ptToFloatVal(pt *sfxpb.DataPoint) *float64 {
 		return nil
 	}
 	var f float64
-	if pt.Value.IntValue != nil {
+	switch {
+	case pt.Value.IntValue != nil:
 		f = float64(*pt.Value.IntValue)
-	} else if pt.Value.DoubleValue != nil {
+	case pt.Value.DoubleValue != nil:
 		f = *pt.Value.DoubleValue
-	} else {
+	default:
 		return nil
 	}
 	return &f
@@ -743,7 +749,7 @@ func aggregateDatapoints(
 // generate map keys.
 func stringifyDimensions(dimensions []*sfxpb.Dimension, exclusions []string) string {
 	const aggregationKeyDelimiter = "//"
-	var aggregationKeyParts = make([]string, 0, len(dimensions))
+	aggregationKeyParts := make([]string, 0, len(dimensions))
 	for _, d := range dimensions {
 		if !dimensionIn(d, exclusions) {
 			aggregationKeyParts = append(aggregationKeyParts, fmt.Sprintf("%s:%s", d.Key, d.Value))
@@ -818,7 +824,7 @@ func convertMetricValue(logger *zap.Logger, dp *sfxpb.DataPoint, newType MetricV
 				zap.String("metric", dp.Metric))
 			return
 		}
-		var intVal = int64(*val)
+		intVal := int64(*val)
 		dp.Value = sfxpb.Datum{IntValue: &intVal}
 	case MetricValueTypeDouble:
 		val := dp.GetValue().IntValue
@@ -827,7 +833,7 @@ func convertMetricValue(logger *zap.Logger, dp *sfxpb.DataPoint, newType MetricV
 				zap.String("metric", dp.Metric))
 			return
 		}
-		var floatVal = float64(*val)
+		floatVal := float64(*val)
 		dp.Value = sfxpb.Datum{DoubleValue: &floatVal}
 	}
 }
@@ -864,7 +870,8 @@ func dropDimensions(dp *sfxpb.DataPoint, rule Rule) {
 
 func filterDimensionsByValues(
 	dimensions []*sfxpb.Dimension,
-	dimensionPairs map[string]map[string]bool) []*sfxpb.Dimension {
+	dimensionPairs map[string]map[string]bool,
+) []*sfxpb.Dimension {
 	if len(dimensions) == 0 {
 		return nil
 	}

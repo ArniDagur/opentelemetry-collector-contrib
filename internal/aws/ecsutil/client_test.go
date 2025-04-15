@@ -1,21 +1,11 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package ecsutil
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -40,14 +30,14 @@ func TestClient(t *testing.T) {
 	require.Equal(t, "hello", string(resp))
 	require.True(t, tr.closed)
 	require.Equal(t, baseURL.String()+"/stats", tr.url)
-	require.Equal(t, 1, len(tr.header))
+	require.Len(t, tr.header, 1)
 	require.Equal(t, "application/json", tr.header["Content-Type"][0])
-	require.Equal(t, "GET", tr.method)
+	require.Equal(t, http.MethodGet, tr.method)
 }
 
 func TestNewClientProvider(t *testing.T) {
 	baseURL, _ := url.Parse("http://localhost:8080")
-	provider := NewClientProvider(*baseURL, confighttp.HTTPClientSettings{}, componenttest.NewNopTelemetrySettings())
+	provider := NewClientProvider(*baseURL, confighttp.NewDefaultClientConfig(), componenttest.NewNopHost(), componenttest.NewNopTelemetrySettings())
 	require.NotNil(t, provider)
 	_, ok := provider.(*defaultClientProvider)
 	require.True(t, ok)
@@ -59,7 +49,7 @@ func TestNewClientProvider(t *testing.T) {
 
 func TestDefaultClient(t *testing.T) {
 	endpoint, _ := url.Parse("http://localhost:8080")
-	client, err := defaultClient(*endpoint, confighttp.HTTPClientSettings{}, componenttest.NewNopTelemetrySettings())
+	client, err := defaultClient(context.Background(), *endpoint, confighttp.NewDefaultClientConfig(), componenttest.NewNopHost(), componenttest.NewNopTelemetrySettings())
 	require.NoError(t, err)
 	require.NotNil(t, client.httpClient.Transport)
 	require.Equal(t, "http://localhost:8080", client.baseURL.String())
@@ -69,6 +59,7 @@ func TestBuildReq(t *testing.T) {
 	endpoint, _ := url.Parse("http://localhost:8080")
 	p := &defaultClientProvider{
 		baseURL:  *endpoint,
+		host:     componenttest.NewNopHost(),
 		settings: componenttest.NewNopTelemetrySettings(),
 	}
 	cl, err := p.BuildClient()
@@ -84,6 +75,7 @@ func TestBuildBadReq(t *testing.T) {
 	endpoint, _ := url.Parse("http://localhost:8080")
 	p := &defaultClientProvider{
 		baseURL:  *endpoint,
+		host:     componenttest.NewNopHost(),
 		settings: componenttest.NewNopTelemetrySettings(),
 	}
 	cl, err := p.BuildClient()
@@ -96,6 +88,7 @@ func TestGetBad(t *testing.T) {
 	endpoint, _ := url.Parse("http://localhost:8080")
 	p := &defaultClientProvider{
 		baseURL:  *endpoint,
+		host:     componenttest.NewNopHost(),
 		settings: componenttest.NewNopTelemetrySettings(),
 	}
 	cl, err := p.BuildClient()
@@ -157,7 +150,7 @@ type fakeRoundTripper struct {
 
 func (f *fakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if f.failOnRT {
-		return nil, fmt.Errorf("failOnRT == true")
+		return nil, errors.New("failOnRT == true")
 	}
 	f.header = req.Header
 	f.method = req.Method
@@ -179,7 +172,7 @@ func (f *fakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			onClose: func() error {
 				f.closed = true
 				if f.errOnClose {
-					return fmt.Errorf("error on close")
+					return errors.New("error on close")
 				}
 				return nil
 			},
@@ -192,7 +185,7 @@ var _ io.Reader = (*failingReader)(nil)
 type failingReader struct{}
 
 func (f *failingReader) Read([]byte) (n int, err error) {
-	return 0, fmt.Errorf("error on read")
+	return 0, errors.New("error on read")
 }
 
 var _ io.ReadCloser = (*fakeReadCloser)(nil)

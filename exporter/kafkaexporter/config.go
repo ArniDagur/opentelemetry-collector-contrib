@@ -1,100 +1,124 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package kafkaexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/kafkaexporter"
 
 import (
-	"fmt"
-	"time"
-
-	"github.com/Shopify/sarama"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/kafka/configkafka"
 )
+
+var _ component.Config = (*Config)(nil)
 
 // Config defines configuration for Kafka exporter.
 type Config struct {
-	config.ExporterSettings        `mapstructure:",squash"` // squash ensures fields are correctly decoded in embedded struct
-	exporterhelper.TimeoutSettings `mapstructure:",squash"` // squash ensures fields are correctly decoded in embedded struct.
-	exporterhelper.QueueSettings   `mapstructure:"sending_queue"`
-	exporterhelper.RetrySettings   `mapstructure:"retry_on_failure"`
+	TimeoutSettings           exporterhelper.TimeoutConfig    `mapstructure:",squash"` // squash ensures fields are correctly decoded in embedded struct.
+	QueueSettings             exporterhelper.QueueBatchConfig `mapstructure:"sending_queue"`
+	configretry.BackOffConfig `mapstructure:"retry_on_failure"`
+	configkafka.ClientConfig  `mapstructure:",squash"`
+	Producer                  configkafka.ProducerConfig `mapstructure:"producer"`
 
-	// The list of kafka brokers (default localhost:9092)
-	Brokers []string `mapstructure:"brokers"`
-	// Kafka protocol version
-	ProtocolVersion string `mapstructure:"protocol_version"`
-	// The name of the kafka topic to export to (default otlp_spans for traces, otlp_metrics for metrics)
+	// Logs holds configuration about how logs should be sent to Kafka.
+	Logs SignalConfig `mapstructure:"logs"`
+
+	// Metrics holds configuration about how metrics should be sent to Kafka.
+	Metrics SignalConfig `mapstructure:"metrics"`
+
+	// Traces holds configuration about how traces should be sent to Kafka.
+	Traces SignalConfig `mapstructure:"traces"`
+
+	// Topic holds the name of the Kafka topic to which data should be exported.
+	//
+	// Topic has no default. If explicitly specified, it will take precedence over
+	// the default values of logs::topic, metrics::topic, and traces::topic.
+	//
+	// Deprecated [v0.124.0]: use logs::topic, metrics::topic, and traces::topic instead.
 	Topic string `mapstructure:"topic"`
 
-	// Encoding of messages (default "otlp_proto")
+	// IncludeMetadataKeys indicates the receiver's client metadata keys to propagate as Kafka message headers.
+	IncludeMetadataKeys []string `mapstructure:"include_metadata_keys"`
+
+	// TopicFromAttribute is the name of the attribute to use as the topic name.
+	TopicFromAttribute string `mapstructure:"topic_from_attribute"`
+
+	// Encoding holds the encoding of Kafka message values.
+	//
+	// Encoding has no default. If explicitly specified, it will take precedence over
+	// the default values of logs::encoding, metrics::encoding, and traces::encoding.
+	//
+	// Deprecated [v0.124.0]: use logs::encoding, metrics::encoding, and traces::encoding instead.
 	Encoding string `mapstructure:"encoding"`
 
-	// Metadata is the namespace for metadata management properties used by the
-	// Client, and shared by the Producer/Consumer.
-	Metadata Metadata `mapstructure:"metadata"`
+	// PartitionTracesByID sets the message key of outgoing trace messages to the trace ID.
+	//
+	// NOTE: this does not have any effect for Jaeger encodings. Jaeger encodings always use
+	// use the trace ID for the message key.
+	PartitionTracesByID bool `mapstructure:"partition_traces_by_id"`
 
-	// Producer is the namespaces for producer properties used only by the Producer
-	Producer Producer `mapstructure:"producer"`
+	// PartitionMetricsByResourceAttributes controls the partitioning of metrics messages by
+	// resource. If this is true, then the message key will be set to a hash of the resource's
+	// identifying attributes.
+	PartitionMetricsByResourceAttributes bool `mapstructure:"partition_metrics_by_resource_attributes"`
 
-	// Authentication defines used authentication mechanism.
-	Authentication Authentication `mapstructure:"auth"`
+	// PartitionLogsByResourceAttributes controls the partitioning of logs messages by resource.
+	// If this is true, then the message key will be set to a hash of the resource's identifying
+	// attributes.
+	PartitionLogsByResourceAttributes bool `mapstructure:"partition_logs_by_resource_attributes"`
 }
 
-// Metadata defines configuration for retrieving metadata from the broker.
-type Metadata struct {
-	// Whether to maintain a full set of metadata for all topics, or just
-	// the minimal set that has been necessary so far. The full set is simpler
-	// and usually more convenient, but can take up a substantial amount of
-	// memory if you have many topics and partitions. Defaults to true.
-	Full bool `mapstructure:"full"`
-
-	// Retry configuration for metadata.
-	// This configuration is useful to avoid race conditions when broker
-	// is starting at the same time as collector.
-	Retry MetadataRetry `mapstructure:"retry"`
-}
-
-// Producer defines configuration for producer
-type Producer struct {
-	// Maximum message bytes the producer will accept to produce.
-	MaxMessageBytes int `mapstructure:"max_message_bytes"`
-
-	// RequiredAcks Number of acknowledgements required to assume that a message has been sent.
-	// https://pkg.go.dev/github.com/Shopify/sarama@v1.30.0#RequiredAcks
-	// The options are:
-	//   0 -> NoResponse.  doesn't send any response
-	//   1 -> WaitForLocal. waits for only the local commit to succeed before responding ( default )
-	//   -1 -> WaitForAll. waits for all in-sync replicas to commit before responding.
-	RequiredAcks sarama.RequiredAcks `mapstructure:"required_acks"`
-}
-
-// MetadataRetry defines retry configuration for Metadata.
-type MetadataRetry struct {
-	// The total number of times to retry a metadata request when the
-	// cluster is in the middle of a leader election or at startup (default 3).
-	Max int `mapstructure:"max"`
-	// How long to wait for leader election to occur before retrying
-	// (default 250ms). Similar to the JVM's `retry.backoff.ms`.
-	Backoff time.Duration `mapstructure:"backoff"`
-}
-
-var _ config.Exporter = (*Config)(nil)
-
-// Validate checks if the exporter configuration is valid
-func (cfg *Config) Validate() error {
-	if cfg.Producer.RequiredAcks < -1 || cfg.Producer.RequiredAcks > 1 {
-		return fmt.Errorf("producer.required_acks has to be between -1 and 1. configured value %v", cfg.Producer.RequiredAcks)
+func (c *Config) Unmarshal(conf *confmap.Conf) error {
+	if err := conf.Unmarshal(c); err != nil {
+		return err
 	}
-	return nil
+	// Check if deprecated fields have been explicitly set,
+	// in which case they should be used instead of signal-
+	// specific defaults.
+	var zeroConfig Config
+	if err := conf.Unmarshal(&zeroConfig); err != nil {
+		return err
+	}
+	if c.Topic != "" {
+		if zeroConfig.Logs.Topic == "" {
+			c.Logs.Topic = c.Topic
+		}
+		if zeroConfig.Metrics.Topic == "" {
+			c.Metrics.Topic = c.Topic
+		}
+		if zeroConfig.Traces.Topic == "" {
+			c.Traces.Topic = c.Topic
+		}
+	}
+	if c.Encoding != "" {
+		if zeroConfig.Logs.Encoding == "" {
+			c.Logs.Encoding = c.Encoding
+		}
+		if zeroConfig.Metrics.Encoding == "" {
+			c.Metrics.Encoding = c.Encoding
+		}
+		if zeroConfig.Traces.Encoding == "" {
+			c.Traces.Encoding = c.Encoding
+		}
+	}
+	return conf.Unmarshal(c)
+}
+
+// SignalConfig holds signal-specific configuration for the Kafka exporter.
+type SignalConfig struct {
+	// Topic holds the name of the Kafka topic to which messages of the
+	// signal type should be produced.
+	//
+	// The default depends on the signal type:
+	//  - "otlp_spans" for traces
+	//  - "otlp_metrics" for metrics
+	//  - "otlp_logs" for logs
+	Topic string `mapstructure:"topic"`
+
+	// Encoding holds the encoding of messages for the signal type.
+	//
+	// Defaults to "otlp_proto".
+	Encoding string `mapstructure:"encoding"`
 }

@@ -1,204 +1,242 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package attributesprocessor
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/service/servicetest"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/confmap/xconfmap"
+	"go.opentelemetry.io/collector/consumer/consumertest"
+	"go.opentelemetry.io/collector/processor/processortest"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/attraction"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/processor/filterconfig"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/processor/filterset"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/filter/filterconfig"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/filter/filterset"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/attributesprocessor/internal/metadata"
 )
 
-func TestLoadingConfig(t *testing.T) {
-	factories, err := componenttest.NopFactories()
-	assert.NoError(t, err)
+func TestLoadConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id: component.NewIDWithName(metadata.Type, "insert"),
+			expected: &Config{
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "attribute1", Value: 123, Action: attraction.INSERT},
+						{Key: "string key", FromAttribute: "anotherkey", Action: attraction.INSERT},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "update"),
+			expected: &Config{
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "boo", FromAttribute: "foo", Action: attraction.UPDATE},
+						{Key: "db.secret", Value: "redacted", Action: attraction.UPDATE},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "upsert"),
+			expected: &Config{
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "region", Value: "planet-earth", Action: attraction.UPSERT},
+						{Key: "new_user_key", FromAttribute: "user_key", Action: attraction.UPSERT},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "delete"),
+			expected: &Config{
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "credit_card", Action: attraction.DELETE},
+						{Key: "duplicate_key", Action: attraction.DELETE},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "hash"),
+			expected: &Config{
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "user.email", Action: attraction.HASH},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "excludemulti"),
+			expected: &Config{
+				MatchConfig: filterconfig.MatchConfig{
+					Exclude: &filterconfig.MatchProperties{
+						Config:   *createConfig(filterset.Strict),
+						Services: []string{"svcA", "svcB"},
+						Attributes: []filterconfig.Attribute{
+							{Key: "env", Value: "dev"},
+							{Key: "test_request"},
+						},
+					},
+				},
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "credit_card", Action: attraction.DELETE},
+						{Key: "duplicate_key", Action: attraction.DELETE},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "includeservices"),
+			expected: &Config{
+				MatchConfig: filterconfig.MatchConfig{
+					Include: &filterconfig.MatchProperties{
+						Config:   *createConfig(filterset.Regexp),
+						Services: []string{"auth.*", "login.*"},
+					},
+				},
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "credit_card", Action: attraction.DELETE},
+						{Key: "duplicate_key", Action: attraction.DELETE},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "selectiveprocessing"),
+			expected: &Config{
+				MatchConfig: filterconfig.MatchConfig{
+					Include: &filterconfig.MatchProperties{
+						Config:   *createConfig(filterset.Strict),
+						Services: []string{"svcA", "svcB"},
+					},
+					Exclude: &filterconfig.MatchProperties{
+						Config: *createConfig(filterset.Strict),
+						Attributes: []filterconfig.Attribute{
+							{Key: "redact_trace", Value: false},
+						},
+					},
+				},
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "credit_card", Action: attraction.DELETE},
+						{Key: "duplicate_key", Action: attraction.DELETE},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "complex"),
+			expected: &Config{
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "operation", Value: "default", Action: attraction.INSERT},
+						{Key: "svc.operation", FromAttribute: "operation", Action: attraction.UPSERT},
+						{Key: "operation", Action: attraction.DELETE},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "example"),
+			expected: &Config{
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "db.table", Action: attraction.DELETE},
+						{Key: "redacted_span", Value: true, Action: attraction.UPSERT},
+						{Key: "copy_key", FromAttribute: "key_original", Action: attraction.UPDATE},
+						{Key: "account_id", Value: 2245, Action: attraction.INSERT},
+						{Key: "account_password", Action: attraction.DELETE},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "regexp"),
+			expected: &Config{
+				MatchConfig: filterconfig.MatchConfig{
+					Include: &filterconfig.MatchProperties{
+						Config:   *createConfig(filterset.Regexp),
+						Services: []string{"auth.*"},
+					},
+					Exclude: &filterconfig.MatchProperties{
+						Config:    *createConfig(filterset.Regexp),
+						SpanNames: []string{"login.*"},
+					},
+				},
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "password", Action: attraction.UPDATE, Value: "obfuscated"},
+						{Key: "token", Action: attraction.DELETE},
+					},
+				},
+			},
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, "convert"),
+			expected: &Config{
+				Settings: attraction.Settings{
+					Actions: []attraction.ActionKeyValue{
+						{Key: "http.status_code", Action: attraction.CONVERT, ConvertedType: "int"},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+			require.NoError(t, err)
+
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
+
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
+
+			assert.NoError(t, xconfmap.Validate(cfg))
+			assert.Equal(t, tt.expected, cfg)
+		})
+	}
+}
+
+func TestSpanConfigUsedWithmetrics(t *testing.T) {
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+	require.NoError(t, err)
 
 	factory := NewFactory()
-	factories.Processors[typeStr] = factory
-	cfg, err := servicetest.LoadConfigAndValidate(filepath.Join("testdata", "config.yaml"), factories)
-	assert.NoError(t, err)
-	require.NotNil(t, cfg)
+	cfg := factory.CreateDefaultConfig()
 
-	p0 := cfg.Processors[config.NewComponentIDWithName(typeStr, "insert")]
-	assert.Equal(t, p0, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "insert")),
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "attribute1", Value: 123, Action: attraction.INSERT},
-				{Key: "string key", FromAttribute: "anotherkey", Action: attraction.INSERT},
-			},
-		},
-	})
+	sub, err := cm.Sub("attributes/servicesmetrics")
 
-	p1 := cfg.Processors[config.NewComponentIDWithName(typeStr, "update")]
-	assert.Equal(t, p1, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "update")),
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "boo", FromAttribute: "foo", Action: attraction.UPDATE},
-				{Key: "db.secret", Value: "redacted", Action: attraction.UPDATE},
-			},
-		},
-	})
+	require.NoError(t, err)
+	require.NoError(t, sub.Unmarshal(cfg))
 
-	p2 := cfg.Processors[config.NewComponentIDWithName(typeStr, "upsert")]
-	assert.Equal(t, p2, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "upsert")),
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "region", Value: "planet-earth", Action: attraction.UPSERT},
-				{Key: "new_user_key", FromAttribute: "user_key", Action: attraction.UPSERT},
-			},
-		},
-	})
+	assert.NoError(t, xconfmap.Validate(cfg))
 
-	p3 := cfg.Processors[config.NewComponentIDWithName(typeStr, "delete")]
-	assert.Equal(t, p3, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "delete")),
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "credit_card", Action: attraction.DELETE},
-				{Key: "duplicate_key", Action: attraction.DELETE},
-			},
-		},
-	})
+	sink := consumertest.MetricsSink{}
 
-	p4 := cfg.Processors[config.NewComponentIDWithName(typeStr, "hash")]
-	assert.Equal(t, p4, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "hash")),
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "user.email", Action: attraction.HASH},
-			},
-		},
-	})
-
-	p5 := cfg.Processors[config.NewComponentIDWithName(typeStr, "excludemulti")]
-	assert.Equal(t, p5, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "excludemulti")),
-		MatchConfig: filterconfig.MatchConfig{
-			Exclude: &filterconfig.MatchProperties{
-				Config:   *createConfig(filterset.Strict),
-				Services: []string{"svcA", "svcB"},
-				Attributes: []filterconfig.Attribute{
-					{Key: "env", Value: "dev"},
-					{Key: "test_request"},
-				},
-			},
-		},
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "credit_card", Action: attraction.DELETE},
-				{Key: "duplicate_key", Action: attraction.DELETE},
-			},
-		},
-	})
-
-	p6 := cfg.Processors[config.NewComponentIDWithName(typeStr, "includeservices")]
-	assert.Equal(t, p6, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "includeservices")),
-		MatchConfig: filterconfig.MatchConfig{
-			Include: &filterconfig.MatchProperties{
-				Config:   *createConfig(filterset.Regexp),
-				Services: []string{"auth.*", "login.*"},
-			},
-		},
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "credit_card", Action: attraction.DELETE},
-				{Key: "duplicate_key", Action: attraction.DELETE},
-			},
-		},
-	})
-
-	p7 := cfg.Processors[config.NewComponentIDWithName(typeStr, "selectiveprocessing")]
-	assert.Equal(t, p7, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "selectiveprocessing")),
-		MatchConfig: filterconfig.MatchConfig{
-			Include: &filterconfig.MatchProperties{
-				Config:   *createConfig(filterset.Strict),
-				Services: []string{"svcA", "svcB"},
-			},
-			Exclude: &filterconfig.MatchProperties{
-				Config: *createConfig(filterset.Strict),
-				Attributes: []filterconfig.Attribute{
-					{Key: "redact_trace", Value: false},
-				},
-			},
-		},
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "credit_card", Action: attraction.DELETE},
-				{Key: "duplicate_key", Action: attraction.DELETE},
-			},
-		},
-	})
-
-	p8 := cfg.Processors[config.NewComponentIDWithName(typeStr, "complex")]
-	assert.Equal(t, p8, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "complex")),
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "operation", Value: "default", Action: attraction.INSERT},
-				{Key: "svc.operation", FromAttribute: "operation", Action: attraction.UPSERT},
-				{Key: "operation", Action: attraction.DELETE},
-			},
-		},
-	})
-
-	p9 := cfg.Processors[config.NewComponentIDWithName(typeStr, "example")]
-	assert.Equal(t, p9, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "example")),
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "db.table", Action: attraction.DELETE},
-				{Key: "redacted_span", Value: true, Action: attraction.UPSERT},
-				{Key: "copy_key", FromAttribute: "key_original", Action: attraction.UPDATE},
-				{Key: "account_id", Value: 2245, Action: attraction.INSERT},
-				{Key: "account_password", Action: attraction.DELETE},
-			},
-		},
-	})
-
-	p10 := cfg.Processors[config.NewComponentIDWithName(typeStr, "regexp")]
-	assert.Equal(t, p10, &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, "regexp")),
-		MatchConfig: filterconfig.MatchConfig{
-			Include: &filterconfig.MatchProperties{
-				Config:   *createConfig(filterset.Regexp),
-				Services: []string{"auth.*"},
-			},
-			Exclude: &filterconfig.MatchProperties{
-				Config:    *createConfig(filterset.Regexp),
-				SpanNames: []string{"login.*"},
-			},
-		},
-		Settings: attraction.Settings{
-			Actions: []attraction.ActionKeyValue{
-				{Key: "password", Action: attraction.UPDATE, Value: "obfuscated"},
-				{Key: "token", Action: attraction.DELETE},
-			},
-		},
-	})
-
+	_, err = NewFactory().CreateMetrics(context.Background(), processortest.NewNopSettings(metadata.Type), cfg, &sink)
+	require.Error(t, err)
 }

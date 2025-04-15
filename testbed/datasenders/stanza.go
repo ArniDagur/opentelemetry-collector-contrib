@@ -1,40 +1,29 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package datasenders // import "github.com/open-telemetry/opentelemetry-collector-contrib/testbed/datasenders"
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/testbed/testbed"
 )
 
-// TODO: Extract common bits from FileLogWriter and NewFluentBitFileLogWriter
-// and generalize as FileLogWriter.
-
 type FileLogWriter struct {
-	file *os.File
+	file    *os.File
+	retry   string
+	storage string
 }
 
 // Ensure FileLogWriter implements LogDataSender.
@@ -42,8 +31,8 @@ var _ testbed.LogDataSender = (*FileLogWriter)(nil)
 
 // NewFileLogWriter creates a new data sender that will write log entries to a
 // file, to be tailed by FluentBit and sent to the collector.
-func NewFileLogWriter() *FileLogWriter {
-	file, err := ioutil.TempFile("", "perf-logs.log")
+func NewFileLogWriter(t *testing.T) *FileLogWriter {
+	file, err := os.CreateTemp(t.TempDir(), "perf-logs.log")
 	if err != nil {
 		panic("failed to create temp file")
 	}
@@ -55,6 +44,16 @@ func NewFileLogWriter() *FileLogWriter {
 	return f
 }
 
+func (f *FileLogWriter) WithRetry(retry string) *FileLogWriter {
+	f.retry = retry
+	return f
+}
+
+func (f *FileLogWriter) WithStorage(storage string) *FileLogWriter {
+	f.storage = storage
+	return f
+}
+
 func (f *FileLogWriter) Capabilities() consumer.Capabilities {
 	return consumer.Capabilities{MutatesData: false}
 }
@@ -63,10 +62,10 @@ func (f *FileLogWriter) Start() error {
 	return nil
 }
 
-func (f *FileLogWriter) ConsumeLogs(_ context.Context, logs pdata.Logs) error {
+func (f *FileLogWriter) ConsumeLogs(_ context.Context, logs plog.Logs) error {
 	for i := 0; i < logs.ResourceLogs().Len(); i++ {
-		for j := 0; j < logs.ResourceLogs().At(i).InstrumentationLibraryLogs().Len(); j++ {
-			ills := logs.ResourceLogs().At(i).InstrumentationLibraryLogs().At(j)
+		for j := 0; j < logs.ResourceLogs().At(i).ScopeLogs().Len(); j++ {
+			ills := logs.ResourceLogs().At(i).ScopeLogs().At(j)
 			for k := 0; k < ills.LogRecords().Len(); k++ {
 				_, err := f.file.Write(append(f.convertLogToTextLine(ills.LogRecords().At(k)), '\n'))
 				if err != nil {
@@ -78,7 +77,7 @@ func (f *FileLogWriter) ConsumeLogs(_ context.Context, logs pdata.Logs) error {
 	return nil
 }
 
-func (f *FileLogWriter) convertLogToTextLine(lr pdata.LogRecord) []byte {
+func (f *FileLogWriter) convertLogToTextLine(lr plog.LogRecord) []byte {
 	sb := strings.Builder{}
 
 	// Timestamp
@@ -89,28 +88,27 @@ func (f *FileLogWriter) convertLogToTextLine(lr pdata.LogRecord) []byte {
 	sb.WriteString(lr.SeverityText())
 	sb.WriteString(" ")
 
-	if lr.Body().Type() == pdata.AttributeValueTypeString {
-		sb.WriteString(lr.Body().StringVal())
+	if lr.Body().Type() == pcommon.ValueTypeStr {
+		sb.WriteString(lr.Body().Str())
 	}
 
-	lr.Attributes().Range(func(k string, v pdata.AttributeValue) bool {
+	for k, v := range lr.Attributes().All() {
 		sb.WriteString(" ")
 		sb.WriteString(k)
 		sb.WriteString("=")
 		switch v.Type() {
-		case pdata.AttributeValueTypeString:
-			sb.WriteString(v.StringVal())
-		case pdata.AttributeValueTypeInt:
-			sb.WriteString(strconv.FormatInt(v.IntVal(), 10))
-		case pdata.AttributeValueTypeDouble:
-			sb.WriteString(strconv.FormatFloat(v.DoubleVal(), 'f', -1, 64))
-		case pdata.AttributeValueTypeBool:
-			sb.WriteString(strconv.FormatBool(v.BoolVal()))
+		case pcommon.ValueTypeStr:
+			sb.WriteString(v.Str())
+		case pcommon.ValueTypeInt:
+			sb.WriteString(strconv.FormatInt(v.Int(), 10))
+		case pcommon.ValueTypeDouble:
+			sb.WriteString(strconv.FormatFloat(v.Double(), 'f', -1, 64))
+		case pcommon.ValueTypeBool:
+			sb.WriteString(strconv.FormatBool(v.Bool()))
 		default:
 			panic("missing case")
 		}
-		return true
-	})
+	}
 
 	return []byte(sb.String())
 }
@@ -130,11 +128,13 @@ func (f *FileLogWriter) GenConfigYAMLStr() string {
       - type: regex_parser
         regex: '^(?P<time>\d{4}-\d{2}-\d{2}) (?P<sev>[A-Z0-9]*) (?P<msg>.*)$'
         timestamp:
-          parse_from: time
+          parse_from: attributes.time
           layout: '%%Y-%%m-%%d'
         severity:
-          parse_from: sev
-`, f.file.Name())
+          parse_from: attributes.sev
+    %s
+    %s
+`, f.file.Name(), f.retry, f.storage)
 }
 
 func (f *FileLogWriter) ProtocolName() string {
@@ -145,11 +145,8 @@ func (f *FileLogWriter) GetEndpoint() net.Addr {
 	return nil
 }
 
-func NewLocalFileStorageExtension() map[string]string {
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		panic("failed to create temp storage dir")
-	}
+func NewLocalFileStorageExtension(t *testing.T) map[string]string {
+	tempDir := t.TempDir()
 
 	return map[string]string{
 		"file_storage": fmt.Sprintf(`

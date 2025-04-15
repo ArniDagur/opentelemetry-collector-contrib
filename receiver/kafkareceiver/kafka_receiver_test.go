@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package kafkareceiver
 
@@ -18,108 +7,86 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opencensus.io/stats/view"
+	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config/configtls"
+	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumertest"
-	"go.opentelemetry.io/collector/model/otlp"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.opentelemetry.io/collector/obsreport"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/pdata/testdata"
+	"go.opentelemetry.io/collector/receiver/receiverhelper"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/kafkaexporter"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/testdata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkareceiver/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkareceiver/internal/metadatatest"
 )
-
-func TestNewTracesReceiver_version_err(t *testing.T) {
-	c := Config{
-		Encoding:        defaultEncoding,
-		ProtocolVersion: "none",
-	}
-	r, err := newTracesReceiver(c, componenttest.NewNopReceiverCreateSettings(), defaultTracesUnmarshalers(), consumertest.NewNop())
-	assert.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestNewTracesReceiver_encoding_err(t *testing.T) {
-	c := Config{
-		Encoding: "foo",
-	}
-	r, err := newTracesReceiver(c, componenttest.NewNopReceiverCreateSettings(), defaultTracesUnmarshalers(), consumertest.NewNop())
-	require.Error(t, err)
-	assert.Nil(t, r)
-	assert.EqualError(t, err, errUnrecognizedEncoding.Error())
-}
-
-func TestNewTracesReceiver_err_auth_type(t *testing.T) {
-	c := Config{
-		ProtocolVersion: "2.0.0",
-		Authentication: kafkaexporter.Authentication{
-			TLS: &configtls.TLSClientSetting{
-				TLSSetting: configtls.TLSSetting{
-					CAFile: "/doesnotexist",
-				},
-			},
-		},
-		Encoding: defaultEncoding,
-		Metadata: kafkaexporter.Metadata{
-			Full: false,
-		},
-	}
-	r, err := newTracesReceiver(c, componenttest.NewNopReceiverCreateSettings(), defaultTracesUnmarshalers(), consumertest.NewNop())
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to load TLS config")
-	assert.Nil(t, r)
-}
 
 func TestTracesReceiverStart(t *testing.T) {
 	c := kafkaTracesConsumer{
-		nextConsumer:  consumertest.NewNop(),
-		settings:      componenttest.NewNopReceiverCreateSettings(),
-		consumerGroup: &testConsumerGroup{},
+		config:           createDefaultConfig(),
+		nextConsumer:     consumertest.NewNop(),
+		consumeLoopWG:    &sync.WaitGroup{},
+		settings:         receivertest.NewNopSettings(metadata.Type),
+		consumerGroup:    &testConsumerGroup{},
+		telemetryBuilder: nopTelemetryBuilder(t),
 	}
 
-	require.NoError(t, c.Start(context.Background(), nil))
+	require.NoError(t, c.Start(context.Background(), componenttest.NewNopHost()))
 	require.NoError(t, c.Shutdown(context.Background()))
 }
 
 func TestTracesReceiverStartConsume(t *testing.T) {
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(receivertest.NewNopSettings(metadata.Type).TelemetrySettings)
+	require.NoError(t, err)
 	c := kafkaTracesConsumer{
-		nextConsumer:  consumertest.NewNop(),
-		settings:      componenttest.NewNopReceiverCreateSettings(),
-		consumerGroup: &testConsumerGroup{},
+		nextConsumer:     consumertest.NewNop(),
+		consumeLoopWG:    &sync.WaitGroup{},
+		settings:         receivertest.NewNopSettings(metadata.Type),
+		consumerGroup:    &testConsumerGroup{},
+		telemetryBuilder: telemetryBuilder,
 	}
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	c.cancelConsumeLoop = cancelFunc
 	require.NoError(t, c.Shutdown(context.Background()))
-	err := c.consumeLoop(ctx, &tracesConsumerGroupHandler{
-		ready: make(chan bool),
+	c.consumeLoopWG.Add(1)
+	c.consumeLoop(ctx, &tracesConsumerGroupHandler{
+		ready:            make(chan bool),
+		telemetryBuilder: telemetryBuilder,
 	})
-	assert.EqualError(t, err, context.Canceled.Error())
 }
 
 func TestTracesReceiver_error(t *testing.T) {
 	zcore, logObserver := observer.New(zapcore.ErrorLevel)
 	logger := zap.New(zcore)
-	settings := componenttest.NewNopReceiverCreateSettings()
+	settings := receivertest.NewNopSettings(metadata.Type)
 	settings.Logger = logger
 
 	expectedErr := errors.New("handler error")
 	c := kafkaTracesConsumer{
-		nextConsumer:  consumertest.NewNop(),
-		settings:      settings,
-		consumerGroup: &testConsumerGroup{err: expectedErr},
+		config:           createDefaultConfig(),
+		nextConsumer:     consumertest.NewNop(),
+		consumeLoopWG:    &sync.WaitGroup{},
+		settings:         settings,
+		consumerGroup:    &testConsumerGroup{err: expectedErr},
+		telemetryBuilder: nopTelemetryBuilder(t),
 	}
 
-	require.NoError(t, c.Start(context.Background(), nil))
+	require.NoError(t, c.Start(context.Background(), componenttest.NewNopHost()))
 	require.NoError(t, c.Shutdown(context.Background()))
 	assert.Eventually(t, func() bool {
 		return logObserver.FilterField(zap.Error(expectedErr)).Len() > 0
@@ -127,35 +94,42 @@ func TestTracesReceiver_error(t *testing.T) {
 }
 
 func TestTracesConsumerGroupHandler(t *testing.T) {
-	view.Unregister(MetricViews()...)
-	views := MetricViews()
-	require.NoError(t, view.Register(views...))
-	defer view.Unregister(views...)
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(context.Background())) })
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(tel.NewTelemetrySettings())
+	require.NoError(t, err)
 
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
+	require.NoError(t, err)
+	var called atomic.Bool
 	c := tracesConsumerGroupHandler{
-		unmarshaler:  newPdataTracesUnmarshaler(otlp.NewProtobufTracesUnmarshaler(), defaultEncoding),
-		logger:       zap.NewNop(),
-		ready:        make(chan bool),
-		nextConsumer: consumertest.NewNop(),
-		obsrecv:      obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverCreateSettings: componenttest.NewNopReceiverCreateSettings()}),
+		unmarshaler: &ptrace.ProtoUnmarshaler{},
+		logger:      zap.NewNop(),
+		ready:       make(chan bool),
+		nextConsumer: func() consumer.Traces {
+			c, err := consumer.NewTraces(func(ctx context.Context, _ ptrace.Traces) error {
+				defer called.Store(true)
+				info := client.FromContext(ctx)
+				assert.Equal(t, []string{"abcdefg"}, info.Metadata.Get("x-tenant-id"))
+				assert.Equal(t, []string{"1234", "5678"}, info.Metadata.Get("x-request-ids"))
+				return nil
+			})
+			require.NoError(t, err)
+			return c
+		}(),
+		obsrecv:          obsrecv,
+		headerExtractor:  &nopHeaderExtractor{},
+		telemetryBuilder: telemetryBuilder,
 	}
 
-	testSession := testConsumerGroupSession{}
+	testSession := testConsumerGroupSession{ctx: context.Background()}
 	require.NoError(t, c.Setup(testSession))
 	_, ok := <-c.ready
 	assert.False(t, ok)
-	viewData, err := view.RetrieveData(statPartitionStart.Name())
-	require.NoError(t, err)
-	assert.Equal(t, 1, len(viewData))
-	distData := viewData[0].Data.(*view.SumData)
-	assert.Equal(t, float64(1), distData.Value)
+	assertInternalTelemetry(t, tel, 0)
 
 	require.NoError(t, c.Cleanup(testSession))
-	viewData, err = view.RetrieveData(statPartitionClose.Name())
-	require.NoError(t, err)
-	assert.Equal(t, 1, len(viewData))
-	distData = viewData[0].Data.(*view.SumData)
-	assert.Equal(t, float64(1), distData.Value)
+	assertInternalTelemetry(t, tel, 1)
 
 	groupClaim := testConsumerGroupClaim{
 		messageChan: make(chan *sarama.ConsumerMessage),
@@ -164,22 +138,91 @@ func TestTracesConsumerGroupHandler(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
-		require.NoError(t, c.ConsumeClaim(testSession, groupClaim))
+		assert.NoError(t, c.ConsumeClaim(testSession, groupClaim))
+		wg.Done()
+	}()
+
+	groupClaim.messageChan <- &sarama.ConsumerMessage{
+		Headers: []*sarama.RecordHeader{
+			{
+				Key:   []byte("x-tenant-id"),
+				Value: []byte("abcdefg"),
+			},
+			{
+				Key:   []byte("x-request-ids"),
+				Value: []byte("1234"),
+			},
+			{
+				Key:   []byte("x-request-ids"),
+				Value: []byte("5678"),
+			},
+		},
+	}
+	close(groupClaim.messageChan)
+	wg.Wait()
+	assert.True(t, called.Load()) // Ensure nextConsumer was called.
+}
+
+func TestTracesConsumerGroupHandler_session_done(t *testing.T) {
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(context.Background())) })
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(tel.NewTelemetrySettings())
+	require.NoError(t, err)
+
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
+	require.NoError(t, err)
+	c := tracesConsumerGroupHandler{
+		unmarshaler:      &ptrace.ProtoUnmarshaler{},
+		logger:           zap.NewNop(),
+		ready:            make(chan bool),
+		nextConsumer:     consumertest.NewNop(),
+		obsrecv:          obsrecv,
+		headerExtractor:  &nopHeaderExtractor{},
+		telemetryBuilder: telemetryBuilder,
+	}
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	testSession := testConsumerGroupSession{ctx: ctx}
+	require.NoError(t, c.Setup(testSession))
+	_, ok := <-c.ready
+	assert.False(t, ok)
+	assertInternalTelemetry(t, tel, 0)
+
+	require.NoError(t, c.Cleanup(testSession))
+	assertInternalTelemetry(t, tel, 1)
+
+	groupClaim := testConsumerGroupClaim{
+		messageChan: make(chan *sarama.ConsumerMessage),
+	}
+	defer close(groupClaim.messageChan)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		assert.NoError(t, c.ConsumeClaim(testSession, groupClaim))
 		wg.Done()
 	}()
 
 	groupClaim.messageChan <- &sarama.ConsumerMessage{}
-	close(groupClaim.messageChan)
+	cancelFunc()
 	wg.Wait()
 }
 
 func TestTracesConsumerGroupHandler_error_unmarshal(t *testing.T) {
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
+	require.NoError(t, err)
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(context.Background())) })
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(tel.NewTelemetrySettings())
+	require.NoError(t, err)
 	c := tracesConsumerGroupHandler{
-		unmarshaler:  newPdataTracesUnmarshaler(otlp.NewProtobufTracesUnmarshaler(), defaultEncoding),
-		logger:       zap.NewNop(),
-		ready:        make(chan bool),
-		nextConsumer: consumertest.NewNop(),
-		obsrecv:      obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverCreateSettings: componenttest.NewNopReceiverCreateSettings()}),
+		unmarshaler:      &ptrace.ProtoUnmarshaler{},
+		logger:           zap.NewNop(),
+		ready:            make(chan bool),
+		nextConsumer:     consumertest.NewNop(),
+		obsrecv:          obsrecv,
+		headerExtractor:  &nopHeaderExtractor{},
+		telemetryBuilder: telemetryBuilder,
 	}
 
 	wg := sync.WaitGroup{}
@@ -188,123 +231,151 @@ func TestTracesConsumerGroupHandler_error_unmarshal(t *testing.T) {
 		messageChan: make(chan *sarama.ConsumerMessage),
 	}
 	go func() {
-		err := c.ConsumeClaim(testConsumerGroupSession{}, groupClaim)
-		require.Error(t, err)
+		err := c.ConsumeClaim(testConsumerGroupSession{ctx: context.Background()}, groupClaim)
+		assert.Error(t, err)
 		wg.Done()
 	}()
 	groupClaim.messageChan <- &sarama.ConsumerMessage{Value: []byte("!@#")}
 	close(groupClaim.messageChan)
 	wg.Wait()
+	metadatatest.AssertEqualKafkaReceiverOffsetLag(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 3,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+				attribute.String("partition", "5"),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	metadatatest.AssertEqualKafkaReceiverCurrentOffset(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 0,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+				attribute.String("partition", "5"),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	metadatatest.AssertEqualKafkaReceiverMessages(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 1,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+				attribute.String("partition", "5"),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	metadatatest.AssertEqualKafkaReceiverUnmarshalFailedSpans(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value:      1,
+			Attributes: attribute.NewSet(attribute.String("name", "")),
+		},
+	}, metricdatatest.IgnoreTimestamp())
 }
 
 func TestTracesConsumerGroupHandler_error_nextConsumer(t *testing.T) {
 	consumerError := errors.New("failed to consume")
-	c := tracesConsumerGroupHandler{
-		unmarshaler:  newPdataTracesUnmarshaler(otlp.NewProtobufTracesUnmarshaler(), defaultEncoding),
-		logger:       zap.NewNop(),
-		ready:        make(chan bool),
-		nextConsumer: consumertest.NewErr(consumerError),
-		obsrecv:      obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverCreateSettings: componenttest.NewNopReceiverCreateSettings()}),
-	}
-
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	groupClaim := &testConsumerGroupClaim{
-		messageChan: make(chan *sarama.ConsumerMessage),
-	}
-	go func() {
-		e := c.ConsumeClaim(testConsumerGroupSession{}, groupClaim)
-		assert.EqualError(t, e, consumerError.Error())
-		wg.Done()
-	}()
-
-	td := pdata.NewTraces()
-	td.ResourceSpans().AppendEmpty()
-	bts, err := otlp.NewProtobufTracesMarshaler().MarshalTraces(td)
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
 	require.NoError(t, err)
-	groupClaim.messageChan <- &sarama.ConsumerMessage{Value: bts}
-	close(groupClaim.messageChan)
-	wg.Wait()
-}
 
-func TestNewMetricsReceiver_version_err(t *testing.T) {
-	c := Config{
-		Encoding:        defaultEncoding,
-		ProtocolVersion: "none",
-	}
-	r, err := newMetricsReceiver(c, componenttest.NewNopReceiverCreateSettings(), defaultMetricsUnmarshalers(), consumertest.NewNop())
-	assert.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestNewMetricsReceiver_encoding_err(t *testing.T) {
-	c := Config{
-		Encoding: "foo",
-	}
-	r, err := newMetricsReceiver(c, componenttest.NewNopReceiverCreateSettings(), defaultMetricsUnmarshalers(), consumertest.NewNop())
-	require.Error(t, err)
-	assert.Nil(t, r)
-	assert.EqualError(t, err, errUnrecognizedEncoding.Error())
-}
-
-func TestNewMetricsExporter_err_auth_type(t *testing.T) {
-	c := Config{
-		ProtocolVersion: "2.0.0",
-		Authentication: kafkaexporter.Authentication{
-			TLS: &configtls.TLSClientSetting{
-				TLSSetting: configtls.TLSSetting{
-					CAFile: "/doesnotexist",
-				},
-			},
+	tests := []struct {
+		name               string
+		err, expectedError error
+		expectedBackoff    time.Duration
+	}{
+		{
+			name:            "memory limiter data refused error",
+			err:             errMemoryLimiterDataRefused,
+			expectedError:   errMemoryLimiterDataRefused,
+			expectedBackoff: backoff.DefaultInitialInterval,
 		},
-		Encoding: defaultEncoding,
-		Metadata: kafkaexporter.Metadata{
-			Full: false,
+		{
+			name:            "consumer error that does not require backoff",
+			err:             consumerError,
+			expectedError:   consumerError,
+			expectedBackoff: 0,
 		},
 	}
-	r, err := newMetricsReceiver(c, componenttest.NewNopReceiverCreateSettings(), defaultMetricsUnmarshalers(), consumertest.NewNop())
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to load TLS config")
-	assert.Nil(t, r)
-}
 
-func TestMetricsReceiverStart(t *testing.T) {
-	c := kafkaMetricsConsumer{
-		nextConsumer:  consumertest.NewNop(),
-		settings:      componenttest.NewNopReceiverCreateSettings(),
-		consumerGroup: &testConsumerGroup{},
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backOff := backoff.NewExponentialBackOff()
+			backOff.RandomizationFactor = 0
+			c := tracesConsumerGroupHandler{
+				unmarshaler:      &ptrace.ProtoUnmarshaler{},
+				logger:           zap.NewNop(),
+				ready:            make(chan bool),
+				nextConsumer:     consumertest.NewErr(tt.err),
+				obsrecv:          obsrecv,
+				headerExtractor:  &nopHeaderExtractor{},
+				telemetryBuilder: nopTelemetryBuilder(t),
+				backOff:          backOff,
+			}
+
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			groupClaim := &testConsumerGroupClaim{
+				messageChan: make(chan *sarama.ConsumerMessage),
+			}
+			go func() {
+				start := time.Now()
+				e := c.ConsumeClaim(testConsumerGroupSession{ctx: context.Background()}, groupClaim)
+				end := time.Now()
+				if tt.expectedError != nil {
+					assert.EqualError(t, e, tt.expectedError.Error())
+				} else {
+					assert.NoError(t, e)
+				}
+				assert.WithinDuration(t, start.Add(tt.expectedBackoff), end, 100*time.Millisecond)
+				wg.Done()
+			}()
+
+			td := ptrace.NewTraces()
+			td.ResourceSpans().AppendEmpty()
+			unmarshaler := &ptrace.ProtoMarshaler{}
+			bts, err := unmarshaler.MarshalTraces(td)
+			require.NoError(t, err)
+			groupClaim.messageChan <- &sarama.ConsumerMessage{Value: bts}
+			close(groupClaim.messageChan)
+			wg.Wait()
+		})
 	}
-
-	require.NoError(t, c.Start(context.Background(), nil))
-	require.NoError(t, c.Shutdown(context.Background()))
 }
 
 func TestMetricsReceiverStartConsume(t *testing.T) {
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(receivertest.NewNopSettings(metadata.Type).TelemetrySettings)
+	require.NoError(t, err)
 	c := kafkaMetricsConsumer{
-		nextConsumer:  consumertest.NewNop(),
-		settings:      componenttest.NewNopReceiverCreateSettings(),
-		consumerGroup: &testConsumerGroup{},
+		nextConsumer:     consumertest.NewNop(),
+		consumeLoopWG:    &sync.WaitGroup{},
+		settings:         receivertest.NewNopSettings(metadata.Type),
+		consumerGroup:    &testConsumerGroup{},
+		telemetryBuilder: telemetryBuilder,
 	}
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	c.cancelConsumeLoop = cancelFunc
 	require.NoError(t, c.Shutdown(context.Background()))
-	err := c.consumeLoop(ctx, &logsConsumerGroupHandler{
-		ready: make(chan bool),
+	c.consumeLoopWG.Add(1)
+	c.consumeLoop(ctx, &logsConsumerGroupHandler{
+		ready:            make(chan bool),
+		telemetryBuilder: telemetryBuilder,
 	})
-	assert.EqualError(t, err, context.Canceled.Error())
 }
 
 func TestMetricsReceiver_error(t *testing.T) {
 	zcore, logObserver := observer.New(zapcore.ErrorLevel)
 	logger := zap.New(zcore)
-	settings := componenttest.NewNopReceiverCreateSettings()
+	settings := receivertest.NewNopSettings(metadata.Type)
 	settings.Logger = logger
 
 	expectedErr := errors.New("handler error")
 	c := kafkaMetricsConsumer{
-		nextConsumer:  consumertest.NewNop(),
-		settings:      settings,
-		consumerGroup: &testConsumerGroup{err: expectedErr},
+		config:           createDefaultConfig(),
+		nextConsumer:     consumertest.NewNop(),
+		consumeLoopWG:    &sync.WaitGroup{},
+		settings:         settings,
+		consumerGroup:    &testConsumerGroup{err: expectedErr},
+		telemetryBuilder: nopTelemetryBuilder(t),
 	}
 
 	require.NoError(t, c.Start(context.Background(), componenttest.NewNopHost()))
@@ -315,35 +386,42 @@ func TestMetricsReceiver_error(t *testing.T) {
 }
 
 func TestMetricsConsumerGroupHandler(t *testing.T) {
-	view.Unregister(MetricViews()...)
-	views := MetricViews()
-	require.NoError(t, view.Register(views...))
-	defer view.Unregister(views...)
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(context.Background())) })
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(tel.NewTelemetrySettings())
+	require.NoError(t, err)
 
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
+	require.NoError(t, err)
+	var called atomic.Bool
 	c := metricsConsumerGroupHandler{
-		unmarshaler:  newPdataMetricsUnmarshaler(otlp.NewProtobufMetricsUnmarshaler(), defaultEncoding),
-		logger:       zap.NewNop(),
-		ready:        make(chan bool),
-		nextConsumer: consumertest.NewNop(),
-		obsrecv:      obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverCreateSettings: componenttest.NewNopReceiverCreateSettings()}),
+		unmarshaler: &pmetric.ProtoUnmarshaler{},
+		logger:      zap.NewNop(),
+		ready:       make(chan bool),
+		nextConsumer: func() consumer.Metrics {
+			c, err := consumer.NewMetrics(func(ctx context.Context, _ pmetric.Metrics) error {
+				defer called.Store(true)
+				info := client.FromContext(ctx)
+				assert.Equal(t, []string{"abcdefg"}, info.Metadata.Get("x-tenant-id"))
+				assert.Equal(t, []string{"1234", "5678"}, info.Metadata.Get("x-request-ids"))
+				return nil
+			})
+			require.NoError(t, err)
+			return c
+		}(),
+		obsrecv:          obsrecv,
+		headerExtractor:  &nopHeaderExtractor{},
+		telemetryBuilder: telemetryBuilder,
 	}
 
-	testSession := testConsumerGroupSession{}
+	testSession := testConsumerGroupSession{ctx: context.Background()}
 	require.NoError(t, c.Setup(testSession))
 	_, ok := <-c.ready
 	assert.False(t, ok)
-	viewData, err := view.RetrieveData(statPartitionStart.Name())
-	require.NoError(t, err)
-	assert.Equal(t, 1, len(viewData))
-	distData := viewData[0].Data.(*view.SumData)
-	assert.Equal(t, float64(1), distData.Value)
+	assertInternalTelemetry(t, tel, 0)
 
 	require.NoError(t, c.Cleanup(testSession))
-	viewData, err = view.RetrieveData(statPartitionClose.Name())
-	require.NoError(t, err)
-	assert.Equal(t, 1, len(viewData))
-	distData = viewData[0].Data.(*view.SumData)
-	assert.Equal(t, float64(1), distData.Value)
+	assertInternalTelemetry(t, tel, 1)
 
 	groupClaim := testConsumerGroupClaim{
 		messageChan: make(chan *sarama.ConsumerMessage),
@@ -352,22 +430,90 @@ func TestMetricsConsumerGroupHandler(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
-		require.NoError(t, c.ConsumeClaim(testSession, groupClaim))
+		assert.NoError(t, c.ConsumeClaim(testSession, groupClaim))
+		wg.Done()
+	}()
+
+	groupClaim.messageChan <- &sarama.ConsumerMessage{
+		Headers: []*sarama.RecordHeader{
+			{
+				Key:   []byte("x-tenant-id"),
+				Value: []byte("abcdefg"),
+			},
+			{
+				Key:   []byte("x-request-ids"),
+				Value: []byte("1234"),
+			},
+			{
+				Key:   []byte("x-request-ids"),
+				Value: []byte("5678"),
+			},
+		},
+	}
+	close(groupClaim.messageChan)
+	wg.Wait()
+	assert.True(t, called.Load()) // Ensure nextConsumer was called.
+}
+
+func TestMetricsConsumerGroupHandler_session_done(t *testing.T) {
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(context.Background())) })
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(tel.NewTelemetrySettings())
+	require.NoError(t, err)
+
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
+	require.NoError(t, err)
+	c := metricsConsumerGroupHandler{
+		unmarshaler:      &pmetric.ProtoUnmarshaler{},
+		logger:           zap.NewNop(),
+		ready:            make(chan bool),
+		nextConsumer:     consumertest.NewNop(),
+		obsrecv:          obsrecv,
+		headerExtractor:  &nopHeaderExtractor{},
+		telemetryBuilder: telemetryBuilder,
+	}
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	testSession := testConsumerGroupSession{ctx: ctx}
+	require.NoError(t, c.Setup(testSession))
+	_, ok := <-c.ready
+	assert.False(t, ok)
+	assertInternalTelemetry(t, tel, 0)
+
+	require.NoError(t, c.Cleanup(testSession))
+	assertInternalTelemetry(t, tel, 1)
+
+	groupClaim := testConsumerGroupClaim{
+		messageChan: make(chan *sarama.ConsumerMessage),
+	}
+	defer close(groupClaim.messageChan)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		assert.NoError(t, c.ConsumeClaim(testSession, groupClaim))
 		wg.Done()
 	}()
 
 	groupClaim.messageChan <- &sarama.ConsumerMessage{}
-	close(groupClaim.messageChan)
+	cancelFunc()
 	wg.Wait()
 }
 
 func TestMetricsConsumerGroupHandler_error_unmarshal(t *testing.T) {
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
+	require.NoError(t, err)
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(context.Background())) })
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(tel.NewTelemetrySettings())
+	require.NoError(t, err)
 	c := metricsConsumerGroupHandler{
-		unmarshaler:  newPdataMetricsUnmarshaler(otlp.NewProtobufMetricsUnmarshaler(), defaultEncoding),
-		logger:       zap.NewNop(),
-		ready:        make(chan bool),
-		nextConsumer: consumertest.NewNop(),
-		obsrecv:      obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverCreateSettings: componenttest.NewNopReceiverCreateSettings()}),
+		unmarshaler:      &pmetric.ProtoUnmarshaler{},
+		logger:           zap.NewNop(),
+		ready:            make(chan bool),
+		nextConsumer:     consumertest.NewNop(),
+		obsrecv:          obsrecv,
+		headerExtractor:  &nopHeaderExtractor{},
+		telemetryBuilder: telemetryBuilder,
 	}
 
 	wg := sync.WaitGroup{}
@@ -376,122 +522,164 @@ func TestMetricsConsumerGroupHandler_error_unmarshal(t *testing.T) {
 		messageChan: make(chan *sarama.ConsumerMessage),
 	}
 	go func() {
-		err := c.ConsumeClaim(testConsumerGroupSession{}, groupClaim)
-		require.Error(t, err)
+		err := c.ConsumeClaim(testConsumerGroupSession{ctx: context.Background()}, groupClaim)
+		assert.Error(t, err)
 		wg.Done()
 	}()
 	groupClaim.messageChan <- &sarama.ConsumerMessage{Value: []byte("!@#")}
 	close(groupClaim.messageChan)
 	wg.Wait()
+	metadatatest.AssertEqualKafkaReceiverOffsetLag(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 3,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+				attribute.String("partition", "5"),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	metadatatest.AssertEqualKafkaReceiverCurrentOffset(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 0,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+				attribute.String("partition", "5"),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	metadatatest.AssertEqualKafkaReceiverMessages(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 1,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+				attribute.String("partition", "5"),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	metadatatest.AssertEqualKafkaReceiverUnmarshalFailedMetricPoints(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value:      1,
+			Attributes: attribute.NewSet(attribute.String("name", "")),
+		},
+	}, metricdatatest.IgnoreTimestamp())
 }
 
 func TestMetricsConsumerGroupHandler_error_nextConsumer(t *testing.T) {
 	consumerError := errors.New("failed to consume")
-	c := metricsConsumerGroupHandler{
-		unmarshaler:  newPdataMetricsUnmarshaler(otlp.NewProtobufMetricsUnmarshaler(), defaultEncoding),
-		logger:       zap.NewNop(),
-		ready:        make(chan bool),
-		nextConsumer: consumertest.NewErr(consumerError),
-		obsrecv:      obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverCreateSettings: componenttest.NewNopReceiverCreateSettings()}),
-	}
-
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	groupClaim := &testConsumerGroupClaim{
-		messageChan: make(chan *sarama.ConsumerMessage),
-	}
-	go func() {
-		e := c.ConsumeClaim(testConsumerGroupSession{}, groupClaim)
-		assert.EqualError(t, e, consumerError.Error())
-		wg.Done()
-	}()
-
-	ld := testdata.GenerateMetricsOneMetric()
-	bts, err := otlp.NewProtobufMetricsMarshaler().MarshalMetrics(ld)
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
 	require.NoError(t, err)
-	groupClaim.messageChan <- &sarama.ConsumerMessage{Value: bts}
-	close(groupClaim.messageChan)
-	wg.Wait()
-}
 
-func TestNewLogsReceiver_version_err(t *testing.T) {
-	c := Config{
-		Encoding:        defaultEncoding,
-		ProtocolVersion: "none",
-	}
-	r, err := newLogsReceiver(c, componenttest.NewNopReceiverCreateSettings(), defaultLogsUnmarshalers(), consumertest.NewNop())
-	assert.Error(t, err)
-	assert.Nil(t, r)
-}
-
-func TestNewLogsReceiver_encoding_err(t *testing.T) {
-	c := Config{
-		Encoding: "foo",
-	}
-	r, err := newLogsReceiver(c, componenttest.NewNopReceiverCreateSettings(), defaultLogsUnmarshalers(), consumertest.NewNop())
-	require.Error(t, err)
-	assert.Nil(t, r)
-	assert.EqualError(t, err, errUnrecognizedEncoding.Error())
-}
-
-func TestNewLogsExporter_err_auth_type(t *testing.T) {
-	c := Config{
-		ProtocolVersion: "2.0.0",
-		Authentication: kafkaexporter.Authentication{
-			TLS: &configtls.TLSClientSetting{
-				TLSSetting: configtls.TLSSetting{
-					CAFile: "/doesnotexist",
-				},
-			},
+	tests := []struct {
+		name               string
+		err, expectedError error
+		expectedBackoff    time.Duration
+	}{
+		{
+			name:            "memory limiter data refused error",
+			err:             errMemoryLimiterDataRefused,
+			expectedError:   errMemoryLimiterDataRefused,
+			expectedBackoff: backoff.DefaultInitialInterval,
 		},
-		Encoding: defaultEncoding,
-		Metadata: kafkaexporter.Metadata{
-			Full: false,
+		{
+			name:            "consumer error that does not require backoff",
+			err:             consumerError,
+			expectedError:   consumerError,
+			expectedBackoff: 0,
 		},
 	}
-	r, err := newLogsReceiver(c, componenttest.NewNopReceiverCreateSettings(), defaultLogsUnmarshalers(), consumertest.NewNop())
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to load TLS config")
-	assert.Nil(t, r)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backOff := backoff.NewExponentialBackOff()
+			backOff.RandomizationFactor = 0
+			c := metricsConsumerGroupHandler{
+				unmarshaler:      &pmetric.ProtoUnmarshaler{},
+				logger:           zap.NewNop(),
+				ready:            make(chan bool),
+				nextConsumer:     consumertest.NewErr(tt.err),
+				obsrecv:          obsrecv,
+				headerExtractor:  &nopHeaderExtractor{},
+				telemetryBuilder: nopTelemetryBuilder(t),
+				backOff:          backOff,
+			}
+
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			groupClaim := &testConsumerGroupClaim{
+				messageChan: make(chan *sarama.ConsumerMessage),
+			}
+			go func() {
+				start := time.Now()
+				e := c.ConsumeClaim(testConsumerGroupSession{ctx: context.Background()}, groupClaim)
+				end := time.Now()
+				if tt.expectedError != nil {
+					assert.EqualError(t, e, tt.expectedError.Error())
+				} else {
+					assert.NoError(t, e)
+				}
+				assert.WithinDuration(t, start.Add(tt.expectedBackoff), end, 100*time.Millisecond)
+				wg.Done()
+			}()
+
+			ld := testdata.GenerateMetrics(1)
+			unmarshaler := &pmetric.ProtoMarshaler{}
+			bts, err := unmarshaler.MarshalMetrics(ld)
+			require.NoError(t, err)
+			groupClaim.messageChan <- &sarama.ConsumerMessage{Value: bts}
+			close(groupClaim.messageChan)
+			wg.Wait()
+		})
+	}
 }
 
 func TestLogsReceiverStart(t *testing.T) {
 	c := kafkaLogsConsumer{
-		nextConsumer:  consumertest.NewNop(),
-		settings:      componenttest.NewNopReceiverCreateSettings(),
-		consumerGroup: &testConsumerGroup{},
+		config:           createDefaultConfig(),
+		nextConsumer:     consumertest.NewNop(),
+		consumeLoopWG:    &sync.WaitGroup{},
+		settings:         receivertest.NewNopSettings(metadata.Type),
+		consumerGroup:    &testConsumerGroup{},
+		telemetryBuilder: nopTelemetryBuilder(t),
 	}
 
-	require.NoError(t, c.Start(context.Background(), nil))
+	require.NoError(t, c.Start(context.Background(), componenttest.NewNopHost()))
 	require.NoError(t, c.Shutdown(context.Background()))
 }
 
 func TestLogsReceiverStartConsume(t *testing.T) {
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(receivertest.NewNopSettings(metadata.Type).TelemetrySettings)
+	require.NoError(t, err)
 	c := kafkaLogsConsumer{
-		nextConsumer:  consumertest.NewNop(),
-		settings:      componenttest.NewNopReceiverCreateSettings(),
-		consumerGroup: &testConsumerGroup{},
+		nextConsumer:     consumertest.NewNop(),
+		consumeLoopWG:    &sync.WaitGroup{},
+		settings:         receivertest.NewNopSettings(metadata.Type),
+		consumerGroup:    &testConsumerGroup{},
+		telemetryBuilder: telemetryBuilder,
 	}
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	c.cancelConsumeLoop = cancelFunc
 	require.NoError(t, c.Shutdown(context.Background()))
-	err := c.consumeLoop(ctx, &logsConsumerGroupHandler{
-		ready: make(chan bool),
+	c.consumeLoopWG.Add(1)
+	c.consumeLoop(ctx, &logsConsumerGroupHandler{
+		ready:            make(chan bool),
+		telemetryBuilder: telemetryBuilder,
 	})
-	assert.EqualError(t, err, context.Canceled.Error())
 }
 
 func TestLogsReceiver_error(t *testing.T) {
 	zcore, logObserver := observer.New(zapcore.ErrorLevel)
 	logger := zap.New(zcore)
-	settings := componenttest.NewNopReceiverCreateSettings()
+	settings := receivertest.NewNopSettings(metadata.Type)
 	settings.Logger = logger
 
 	expectedErr := errors.New("handler error")
 	c := kafkaLogsConsumer{
-		nextConsumer:  consumertest.NewNop(),
-		settings:      settings,
-		consumerGroup: &testConsumerGroup{err: expectedErr},
+		nextConsumer:     consumertest.NewNop(),
+		consumeLoopWG:    &sync.WaitGroup{},
+		settings:         settings,
+		consumerGroup:    &testConsumerGroup{err: expectedErr},
+		config:           createDefaultConfig(),
+		telemetryBuilder: nopTelemetryBuilder(t),
 	}
 
 	require.NoError(t, c.Start(context.Background(), componenttest.NewNopHost()))
@@ -502,35 +690,42 @@ func TestLogsReceiver_error(t *testing.T) {
 }
 
 func TestLogsConsumerGroupHandler(t *testing.T) {
-	view.Unregister(MetricViews()...)
-	views := MetricViews()
-	require.NoError(t, view.Register(views...))
-	defer view.Unregister(views...)
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(context.Background())) })
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(tel.NewTelemetrySettings())
+	require.NoError(t, err)
 
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
+	require.NoError(t, err)
+	var called atomic.Bool
 	c := logsConsumerGroupHandler{
-		unmarshaler:  newPdataLogsUnmarshaler(otlp.NewProtobufLogsUnmarshaler(), defaultEncoding),
-		logger:       zap.NewNop(),
-		ready:        make(chan bool),
-		nextConsumer: consumertest.NewNop(),
-		obsrecv:      obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverCreateSettings: componenttest.NewNopReceiverCreateSettings()}),
+		unmarshaler: &plog.ProtoUnmarshaler{},
+		logger:      zap.NewNop(),
+		ready:       make(chan bool),
+		nextConsumer: func() consumer.Logs {
+			c, err := consumer.NewLogs(func(ctx context.Context, _ plog.Logs) error {
+				defer called.Store(true)
+				info := client.FromContext(ctx)
+				assert.Equal(t, []string{"abcdefg"}, info.Metadata.Get("x-tenant-id"))
+				assert.Equal(t, []string{"1234", "5678"}, info.Metadata.Get("x-request-ids"))
+				return nil
+			})
+			require.NoError(t, err)
+			return c
+		}(),
+		obsrecv:          obsrecv,
+		headerExtractor:  &nopHeaderExtractor{},
+		telemetryBuilder: telemetryBuilder,
 	}
 
-	testSession := testConsumerGroupSession{}
+	testSession := testConsumerGroupSession{ctx: context.Background()}
 	require.NoError(t, c.Setup(testSession))
 	_, ok := <-c.ready
 	assert.False(t, ok)
-	viewData, err := view.RetrieveData(statPartitionStart.Name())
-	require.NoError(t, err)
-	assert.Equal(t, 1, len(viewData))
-	distData := viewData[0].Data.(*view.SumData)
-	assert.Equal(t, float64(1), distData.Value)
+	assertInternalTelemetry(t, tel, 0)
 
 	require.NoError(t, c.Cleanup(testSession))
-	viewData, err = view.RetrieveData(statPartitionClose.Name())
-	require.NoError(t, err)
-	assert.Equal(t, 1, len(viewData))
-	distData = viewData[0].Data.(*view.SumData)
-	assert.Equal(t, float64(1), distData.Value)
+	assertInternalTelemetry(t, tel, 1)
 
 	groupClaim := testConsumerGroupClaim{
 		messageChan: make(chan *sarama.ConsumerMessage),
@@ -539,22 +734,90 @@ func TestLogsConsumerGroupHandler(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
-		require.NoError(t, c.ConsumeClaim(testSession, groupClaim))
+		assert.NoError(t, c.ConsumeClaim(testSession, groupClaim))
+		wg.Done()
+	}()
+
+	groupClaim.messageChan <- &sarama.ConsumerMessage{
+		Headers: []*sarama.RecordHeader{
+			{
+				Key:   []byte("x-tenant-id"),
+				Value: []byte("abcdefg"),
+			},
+			{
+				Key:   []byte("x-request-ids"),
+				Value: []byte("1234"),
+			},
+			{
+				Key:   []byte("x-request-ids"),
+				Value: []byte("5678"),
+			},
+		},
+	}
+	close(groupClaim.messageChan)
+	wg.Wait()
+	assert.True(t, called.Load()) // Ensure nextConsumer was called.
+}
+
+func TestLogsConsumerGroupHandler_session_done(t *testing.T) {
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(context.Background())) })
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(tel.NewTelemetrySettings())
+	require.NoError(t, err)
+
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
+	require.NoError(t, err)
+	c := logsConsumerGroupHandler{
+		unmarshaler:      &plog.ProtoUnmarshaler{},
+		logger:           zap.NewNop(),
+		ready:            make(chan bool),
+		nextConsumer:     consumertest.NewNop(),
+		obsrecv:          obsrecv,
+		headerExtractor:  &nopHeaderExtractor{},
+		telemetryBuilder: telemetryBuilder,
+	}
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	testSession := testConsumerGroupSession{ctx: ctx}
+	require.NoError(t, c.Setup(testSession))
+	_, ok := <-c.ready
+	assert.False(t, ok)
+	assertInternalTelemetry(t, tel, 0)
+
+	require.NoError(t, c.Cleanup(testSession))
+	assertInternalTelemetry(t, tel, 1)
+
+	groupClaim := testConsumerGroupClaim{
+		messageChan: make(chan *sarama.ConsumerMessage),
+	}
+	defer close(groupClaim.messageChan)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		assert.NoError(t, c.ConsumeClaim(testSession, groupClaim))
 		wg.Done()
 	}()
 
 	groupClaim.messageChan <- &sarama.ConsumerMessage{}
-	close(groupClaim.messageChan)
+	cancelFunc()
 	wg.Wait()
 }
 
 func TestLogsConsumerGroupHandler_error_unmarshal(t *testing.T) {
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
+	require.NoError(t, err)
+	tel := componenttest.NewTelemetry()
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(context.Background())) })
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(tel.NewTelemetrySettings())
+	require.NoError(t, err)
 	c := logsConsumerGroupHandler{
-		unmarshaler:  newPdataLogsUnmarshaler(otlp.NewProtobufLogsUnmarshaler(), defaultEncoding),
-		logger:       zap.NewNop(),
-		ready:        make(chan bool),
-		nextConsumer: consumertest.NewNop(),
-		obsrecv:      obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverCreateSettings: componenttest.NewNopReceiverCreateSettings()}),
+		unmarshaler:      &plog.ProtoUnmarshaler{},
+		logger:           zap.NewNop(),
+		ready:            make(chan bool),
+		nextConsumer:     consumertest.NewNop(),
+		obsrecv:          obsrecv,
+		headerExtractor:  &nopHeaderExtractor{},
+		telemetryBuilder: telemetryBuilder,
 	}
 
 	wg := sync.WaitGroup{}
@@ -563,42 +826,116 @@ func TestLogsConsumerGroupHandler_error_unmarshal(t *testing.T) {
 		messageChan: make(chan *sarama.ConsumerMessage),
 	}
 	go func() {
-		err := c.ConsumeClaim(testConsumerGroupSession{}, groupClaim)
-		require.Error(t, err)
+		err := c.ConsumeClaim(testConsumerGroupSession{ctx: context.Background()}, groupClaim)
+		assert.Error(t, err)
 		wg.Done()
 	}()
 	groupClaim.messageChan <- &sarama.ConsumerMessage{Value: []byte("!@#")}
 	close(groupClaim.messageChan)
 	wg.Wait()
+	metadatatest.AssertEqualKafkaReceiverOffsetLag(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 3,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+				attribute.String("partition", "5"),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	metadatatest.AssertEqualKafkaReceiverCurrentOffset(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 0,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+				attribute.String("partition", "5"),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	metadatatest.AssertEqualKafkaReceiverMessages(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 1,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+				attribute.String("partition", "5"),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	metadatatest.AssertEqualKafkaReceiverUnmarshalFailedLogRecords(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value: 1,
+			Attributes: attribute.NewSet(
+				attribute.String("name", ""),
+			),
+		},
+	}, metricdatatest.IgnoreTimestamp())
 }
 
 func TestLogsConsumerGroupHandler_error_nextConsumer(t *testing.T) {
 	consumerError := errors.New("failed to consume")
-	c := logsConsumerGroupHandler{
-		unmarshaler:  newPdataLogsUnmarshaler(otlp.NewProtobufLogsUnmarshaler(), defaultEncoding),
-		logger:       zap.NewNop(),
-		ready:        make(chan bool),
-		nextConsumer: consumertest.NewErr(consumerError),
-		obsrecv:      obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverCreateSettings: componenttest.NewNopReceiverCreateSettings()}),
-	}
-
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	groupClaim := &testConsumerGroupClaim{
-		messageChan: make(chan *sarama.ConsumerMessage),
-	}
-	go func() {
-		e := c.ConsumeClaim(testConsumerGroupSession{}, groupClaim)
-		assert.EqualError(t, e, consumerError.Error())
-		wg.Done()
-	}()
-
-	ld := testdata.GenerateLogsOneLogRecord()
-	bts, err := otlp.NewProtobufLogsMarshaler().MarshalLogs(ld)
+	obsrecv, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{ReceiverCreateSettings: receivertest.NewNopSettings(metadata.Type)})
 	require.NoError(t, err)
-	groupClaim.messageChan <- &sarama.ConsumerMessage{Value: bts}
-	close(groupClaim.messageChan)
-	wg.Wait()
+
+	tests := []struct {
+		name               string
+		err, expectedError error
+		expectedBackoff    time.Duration
+	}{
+		{
+			name:            "memory limiter data refused error",
+			err:             errMemoryLimiterDataRefused,
+			expectedError:   errMemoryLimiterDataRefused,
+			expectedBackoff: backoff.DefaultInitialInterval,
+		},
+		{
+			name:            "consumer error that does not require backoff",
+			err:             consumerError,
+			expectedError:   consumerError,
+			expectedBackoff: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backOff := backoff.NewExponentialBackOff()
+			backOff.RandomizationFactor = 0
+			c := logsConsumerGroupHandler{
+				unmarshaler:      &plog.ProtoUnmarshaler{},
+				logger:           zap.NewNop(),
+				ready:            make(chan bool),
+				nextConsumer:     consumertest.NewErr(tt.err),
+				obsrecv:          obsrecv,
+				headerExtractor:  &nopHeaderExtractor{},
+				telemetryBuilder: nopTelemetryBuilder(t),
+				backOff:          backOff,
+			}
+
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			groupClaim := &testConsumerGroupClaim{
+				messageChan: make(chan *sarama.ConsumerMessage),
+			}
+			go func() {
+				start := time.Now()
+				e := c.ConsumeClaim(testConsumerGroupSession{ctx: context.Background()}, groupClaim)
+				end := time.Now()
+				if tt.expectedError != nil {
+					assert.EqualError(t, e, tt.expectedError.Error())
+				} else {
+					assert.NoError(t, e)
+				}
+				assert.WithinDuration(t, start.Add(tt.expectedBackoff), end, 100*time.Millisecond)
+				wg.Done()
+			}()
+
+			ld := testdata.GenerateLogs(1)
+			unmarshaler := &plog.ProtoMarshaler{}
+			bts, err := unmarshaler.MarshalLogs(ld)
+			require.NoError(t, err)
+			groupClaim.messageChan <- &sarama.ConsumerMessage{Value: bts}
+			close(groupClaim.messageChan)
+			wg.Wait()
+		})
+	}
 }
 
 type testConsumerGroupClaim struct {
@@ -635,6 +972,7 @@ func (t testConsumerGroupClaim) Messages() <-chan *sarama.ConsumerMessage {
 }
 
 type testConsumerGroupSession struct {
+	ctx context.Context
 }
 
 func (t testConsumerGroupSession) Commit() {
@@ -658,13 +996,12 @@ func (t testConsumerGroupSession) MarkOffset(string, int32, int64, string) {
 }
 
 func (t testConsumerGroupSession) ResetOffset(string, int32, int64, string) {
-	panic("implement me")
 }
 
 func (t testConsumerGroupSession) MarkMessage(*sarama.ConsumerMessage, string) {}
 
 func (t testConsumerGroupSession) Context() context.Context {
-	return context.Background()
+	return t.ctx
 }
 
 type testConsumerGroup struct {
@@ -674,9 +1011,9 @@ type testConsumerGroup struct {
 
 var _ sarama.ConsumerGroup = (*testConsumerGroup)(nil)
 
-func (t *testConsumerGroup) Consume(_ context.Context, _ []string, handler sarama.ConsumerGroupHandler) error {
+func (t *testConsumerGroup) Consume(ctx context.Context, _ []string, handler sarama.ConsumerGroupHandler) error {
 	t.once.Do(func() {
-		handler.Setup(testConsumerGroupSession{})
+		_ = handler.Setup(testConsumerGroupSession{ctx: ctx})
 	})
 	return t.err
 }
@@ -689,7 +1026,7 @@ func (t *testConsumerGroup) Close() error {
 	return nil
 }
 
-func (t *testConsumerGroup) Pause(partitions map[string][]int32) {
+func (t *testConsumerGroup) Pause(_ map[string][]int32) {
 	panic("implement me")
 }
 
@@ -697,10 +1034,104 @@ func (t *testConsumerGroup) PauseAll() {
 	panic("implement me")
 }
 
-func (t *testConsumerGroup) Resume(topicPartitions map[string][]int32) {
+func (t *testConsumerGroup) Resume(_ map[string][]int32) {
 	panic("implement me")
 }
 
 func (t *testConsumerGroup) ResumeAll() {
 	panic("implement me")
+}
+
+func assertInternalTelemetry(t *testing.T, tel *componenttest.Telemetry, partitionClose int64) {
+	metadatatest.AssertEqualKafkaReceiverPartitionStart(t, tel, []metricdata.DataPoint[int64]{
+		{
+			Value:      1,
+			Attributes: attribute.NewSet(attribute.String("name", "")),
+		},
+	}, metricdatatest.IgnoreTimestamp())
+	if partitionClose > 0 {
+		metadatatest.AssertEqualKafkaReceiverPartitionClose(t, tel, []metricdata.DataPoint[int64]{
+			{
+				Value:      partitionClose,
+				Attributes: attribute.NewSet(attribute.String("name", "")),
+			},
+		}, metricdatatest.IgnoreTimestamp())
+	}
+}
+
+func nopTelemetryBuilder(t *testing.T) *metadata.TelemetryBuilder {
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(receivertest.NewNopSettings(metadata.Type).TelemetrySettings)
+	require.NoError(t, err)
+	return telemetryBuilder
+}
+
+func Test_newContextWithHeaders(t *testing.T) {
+	type args struct {
+		ctx     context.Context
+		headers []*sarama.RecordHeader
+	}
+	tests := []struct {
+		name string
+		args args
+		want map[string][]string
+	}{
+		{
+			name: "no headers",
+			args: args{
+				ctx:     context.Background(),
+				headers: []*sarama.RecordHeader{},
+			},
+			want: map[string][]string{},
+		},
+		{
+			name: "single header",
+			args: args{
+				ctx: context.Background(),
+				headers: []*sarama.RecordHeader{
+					{Key: []byte("key1"), Value: []byte("value1")},
+				},
+			},
+			want: map[string][]string{
+				"key1": {"value1"},
+			},
+		},
+		{
+			name: "multiple headers",
+			args: args{
+				ctx: context.Background(),
+				headers: []*sarama.RecordHeader{
+					{Key: []byte("key1"), Value: []byte("value1")},
+					{Key: []byte("key2"), Value: []byte("value2")},
+				},
+			},
+			want: map[string][]string{
+				"key1": {"value1"},
+				"key2": {"value2"},
+			},
+		},
+		{
+			name: "duplicate keys",
+			args: args{
+				ctx: context.Background(),
+				headers: []*sarama.RecordHeader{
+					{Key: []byte("key1"), Value: []byte("value1")},
+					{Key: []byte("key1"), Value: []byte("value2")},
+				},
+			},
+			want: map[string][]string{
+				"key1": {"value1", "value2"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newContextWithHeaders(tt.args.ctx, tt.args.headers)
+			clientInfo := client.FromContext(ctx)
+			for k, wantVal := range tt.want {
+				val := clientInfo.Metadata.Get(k)
+				assert.Equal(t, wantVal, val)
+			}
+		})
+	}
 }

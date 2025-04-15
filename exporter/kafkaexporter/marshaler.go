@@ -1,82 +1,108 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package kafkaexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/kafkaexporter"
 
 import (
-	"github.com/Shopify/sarama"
-	"go.opentelemetry.io/collector/model/otlp"
-	"go.opentelemetry.io/collector/model/pdata"
+	"errors"
+	"fmt"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/kafkaexporter/internal/marshaler"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/zipkin/zipkinv2"
 )
 
-// TracesMarshaler marshals traces into Message array.
-type TracesMarshaler interface {
-	// Marshal serializes spans into sarama's ProducerMessages
-	Marshal(traces pdata.Traces, topic string) ([]*sarama.ProducerMessage, error)
+var errUnknownEncodingExtension = errors.New("unknown encoding extension")
 
-	// Encoding returns encoding name
-	Encoding() string
-}
-
-// MetricsMarshaler marshals metrics into Message array
-type MetricsMarshaler interface {
-	// Marshal serializes metrics into sarama's ProducerMessages
-	Marshal(metrics pdata.Metrics, topic string) ([]*sarama.ProducerMessage, error)
-
-	// Encoding returns encoding name
-	Encoding() string
-}
-
-// LogsMarshaler marshals logs into Message array
-type LogsMarshaler interface {
-	// Marshal serializes logs into sarama's ProducerMessages
-	Marshal(logs pdata.Logs, topic string) ([]*sarama.ProducerMessage, error)
-
-	// Encoding returns encoding name
-	Encoding() string
-}
-
-// tracesMarshalers returns map of supported encodings with TracesMarshaler.
-func tracesMarshalers() map[string]TracesMarshaler {
-	otlpPb := newPdataTracesMarshaler(otlp.NewProtobufTracesMarshaler(), defaultEncoding)
-	otlpJSON := newPdataTracesMarshaler(otlp.NewJSONTracesMarshaler(), "otlp_json")
-	jaegerProto := jaegerMarshaler{marshaler: jaegerProtoSpanMarshaler{}}
-	jaegerJSON := jaegerMarshaler{marshaler: newJaegerJSONMarshaler()}
-	return map[string]TracesMarshaler{
-		otlpPb.Encoding():      otlpPb,
-		otlpJSON.Encoding():    otlpJSON,
-		jaegerProto.Encoding(): jaegerProto,
-		jaegerJSON.Encoding():  jaegerJSON,
+func getTracesMarshaler(encoding string, host component.Host) (marshaler.TracesMarshaler, error) {
+	if m, err := loadEncodingExtension[ptrace.Marshaler](host, encoding, "traces"); err != nil {
+		if !errors.Is(err, errUnknownEncodingExtension) {
+			return nil, err
+		}
+	} else {
+		return marshaler.NewPdataTracesMarshaler(m), nil
 	}
+	switch encoding {
+	case "otlp_proto":
+		return marshaler.NewPdataTracesMarshaler(&ptrace.ProtoMarshaler{}), nil
+	case "otlp_json":
+		return marshaler.NewPdataTracesMarshaler(&ptrace.JSONMarshaler{}), nil
+	case "zipkin_proto":
+		return marshaler.NewPdataTracesMarshaler(zipkinv2.NewProtobufTracesMarshaler()), nil
+	case "zipkin_json":
+		return marshaler.NewPdataTracesMarshaler(zipkinv2.NewJSONTracesMarshaler()), nil
+	case "jaeger_proto":
+		return marshaler.JaegerProtoSpanMarshaler{}, nil
+	case "jaeger_json":
+		return marshaler.JaegerJSONSpanMarshaler{}, nil
+	}
+	return nil, fmt.Errorf("unrecognized traces encoding %q", encoding)
 }
 
-// metricsMarshalers returns map of supported encodings and MetricsMarshaler
-func metricsMarshalers() map[string]MetricsMarshaler {
-	otlpPb := newPdataMetricsMarshaler(otlp.NewProtobufMetricsMarshaler(), defaultEncoding)
-	otlpJSON := newPdataMetricsMarshaler(otlp.NewJSONMetricsMarshaler(), "otlp_json")
-	return map[string]MetricsMarshaler{
-		otlpPb.Encoding():   otlpPb,
-		otlpJSON.Encoding(): otlpJSON,
+func getMetricsMarshaler(encoding string, host component.Host) (marshaler.MetricsMarshaler, error) {
+	if m, err := loadEncodingExtension[pmetric.Marshaler](host, encoding, "metrics"); err != nil {
+		if !errors.Is(err, errUnknownEncodingExtension) {
+			return nil, err
+		}
+	} else {
+		return marshaler.NewPdataMetricsMarshaler(m), nil
 	}
+	switch encoding {
+	case "otlp_proto":
+		return marshaler.NewPdataMetricsMarshaler(&pmetric.ProtoMarshaler{}), nil
+	case "otlp_json":
+		return marshaler.NewPdataMetricsMarshaler(&pmetric.JSONMarshaler{}), nil
+	}
+	return nil, fmt.Errorf("unrecognized metrics encoding %q", encoding)
 }
 
-// logsMarshalers returns map of supported encodings and LogsMarshaler
-func logsMarshalers() map[string]LogsMarshaler {
-	otlpPb := newPdataLogsMarshaler(otlp.NewProtobufLogsMarshaler(), defaultEncoding)
-	otlpJSON := newPdataLogsMarshaler(otlp.NewJSONLogsMarshaler(), "otlp_json")
-	return map[string]LogsMarshaler{
-		otlpPb.Encoding():   otlpPb,
-		otlpJSON.Encoding(): otlpJSON,
+func getLogsMarshaler(encoding string, host component.Host) (marshaler.LogsMarshaler, error) {
+	if m, err := loadEncodingExtension[plog.Marshaler](host, encoding, "logs"); err != nil {
+		if !errors.Is(err, errUnknownEncodingExtension) {
+			return nil, err
+		}
+	} else {
+		return marshaler.NewPdataLogsMarshaler(m), nil
 	}
+	switch encoding {
+	case "otlp_proto":
+		return marshaler.NewPdataLogsMarshaler(&plog.ProtoMarshaler{}), nil
+	case "otlp_json":
+		return marshaler.NewPdataLogsMarshaler(&plog.JSONMarshaler{}), nil
+	case "raw":
+		return marshaler.RawLogsMarshaler{}, nil
+	}
+	return nil, fmt.Errorf("unrecognized logs encoding %q", encoding)
+}
+
+// loadEncodingExtension tries to load an available extension for the given encoding.
+func loadEncodingExtension[T any](host component.Host, encoding, signalType string) (T, error) {
+	var zero T
+	extensionID, err := encodingToComponentID(encoding)
+	if err != nil {
+		return zero, err
+	}
+	encodingExtension, ok := host.GetExtensions()[*extensionID]
+	if !ok {
+		return zero, fmt.Errorf("invalid encoding %q: %w", encoding, errUnknownEncodingExtension)
+	}
+	marshaler, ok := encodingExtension.(T)
+	if !ok {
+		return zero, fmt.Errorf("extension %q is not a %s marshaler", encoding, signalType)
+	}
+	return marshaler, nil
+}
+
+// encodingToComponentID converts an encoding string to a component ID using the given encoding as type.
+func encodingToComponentID(encoding string) (*component.ID, error) {
+	componentType, err := component.NewType(encoding)
+	if err != nil {
+		return nil, fmt.Errorf("invalid component type: %w", err)
+	}
+	id := component.NewID(componentType)
+	return &id, nil
 }

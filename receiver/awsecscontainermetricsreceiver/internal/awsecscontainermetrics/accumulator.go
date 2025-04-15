@@ -1,23 +1,13 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awsecscontainermetrics // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awsecscontainermetricsreceiver/internal/awsecscontainermetrics"
 
 import (
 	"time"
 
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/aws/ecsutil"
@@ -25,49 +15,41 @@ import (
 
 // metricDataAccumulator defines the accumulator
 type metricDataAccumulator struct {
-	mds []pdata.Metrics
+	mds []pmetric.Metrics
 }
 
 // getMetricsData generates OT Metrics data from task metadata and docker stats
 func (acc *metricDataAccumulator) getMetricsData(containerStatsMap map[string]*ContainerStats, metadata ecsutil.TaskMetadata, logger *zap.Logger) {
-
 	taskMetrics := ECSMetrics{}
-	timestamp := pdata.NewTimestampFromTime(time.Now())
+	timestamp := pcommon.NewTimestampFromTime(time.Now())
 	taskResource := taskResource(metadata)
 
 	for _, containerMetadata := range metadata.Containers {
-
 		containerResource := containerResource(containerMetadata, logger)
-		taskResource.Attributes().Range(func(k string, av pdata.AttributeValue) bool {
-			containerResource.Attributes().Upsert(k, av)
-			return true
-		})
+		for k, av := range taskResource.Attributes().All() {
+			av.CopyTo(containerResource.Attributes().PutEmpty(k))
+		}
 
 		stats, ok := containerStatsMap[containerMetadata.DockerID]
 
 		if ok && !isEmptyStats(stats) {
-
 			containerMetrics := convertContainerMetrics(stats, logger, containerMetadata)
 			acc.accumulate(convertToOTLPMetrics(containerPrefix, containerMetrics, containerResource, timestamp))
 			aggregateTaskMetrics(&taskMetrics, containerMetrics)
-
 		} else if containerMetadata.FinishedAt != "" && containerMetadata.StartedAt != "" {
-
 			duration, err := calculateDuration(containerMetadata.StartedAt, containerMetadata.FinishedAt)
-
 			if err != nil {
 				logger.Warn("Error time format error found for this container:" + containerMetadata.ContainerName)
 			}
 
 			acc.accumulate(convertStoppedContainerDataToOTMetrics(containerPrefix, containerResource, timestamp, duration))
-
 		}
 	}
 	overrideWithTaskLevelLimit(&taskMetrics, metadata)
 	acc.accumulate(convertToOTLPMetrics(taskPrefix, taskMetrics, taskResource, timestamp))
 }
 
-func (acc *metricDataAccumulator) accumulate(md pdata.Metrics) {
+func (acc *metricDataAccumulator) accumulate(md pmetric.Metrics) {
 	acc.mds = append(acc.mds, md)
 }
 

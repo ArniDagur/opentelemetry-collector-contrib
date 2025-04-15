@@ -1,16 +1,5 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package host // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscontainerinsightreceiver/internal/host"
 
@@ -18,13 +7,13 @@ import (
 	"context"
 	"time"
 
-	awsec2metadata "github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"go.uber.org/zap"
 )
 
 type metadataClient interface {
-	GetInstanceIdentityDocumentWithContext(ctx context.Context) (awsec2metadata.EC2InstanceIdentityDocument, error)
+	GetInstanceIdentityDocument(ctx context.Context, params *imds.GetInstanceIdentityDocumentInput, optFns ...func(*imds.Options)) (*imds.GetInstanceIdentityDocumentOutput, error)
 }
 
 type ec2MetadataProvider interface {
@@ -48,10 +37,11 @@ type ec2Metadata struct {
 
 type ec2MetadataOption func(*ec2Metadata)
 
-func newEC2Metadata(ctx context.Context, session *session.Session, refreshInterval time.Duration,
-	instanceIDReadyC chan bool, instanceIPReadyC chan bool, logger *zap.Logger, options ...ec2MetadataOption) ec2MetadataProvider {
+func newEC2Metadata(ctx context.Context, cfg aws.Config, refreshInterval time.Duration,
+	instanceIDReadyC chan bool, instanceIPReadyC chan bool, logger *zap.Logger, options ...ec2MetadataOption,
+) ec2MetadataProvider {
 	emd := &ec2Metadata{
-		client:           awsec2metadata.New(session),
+		client:           imds.NewFromConfig(cfg),
 		refreshInterval:  refreshInterval,
 		instanceIDReadyC: instanceIDReadyC,
 		instanceIPReadyC: instanceIPReadyC,
@@ -63,7 +53,7 @@ func newEC2Metadata(ctx context.Context, session *session.Session, refreshInterv
 	}
 
 	shouldRefresh := func() bool {
-		//stop the refresh once we get instance ID and type successfully
+		// stop the refresh once we get instance ID and type successfully
 		return emd.instanceID == "" || emd.instanceType == "" || emd.instanceIP == ""
 	}
 
@@ -75,16 +65,16 @@ func newEC2Metadata(ctx context.Context, session *session.Session, refreshInterv
 func (emd *ec2Metadata) refresh(ctx context.Context) {
 	emd.logger.Info("Fetch instance id and type from ec2 metadata")
 
-	doc, err := emd.client.GetInstanceIdentityDocumentWithContext(ctx)
+	resp, err := emd.client.GetInstanceIdentityDocument(ctx, &imds.GetInstanceIdentityDocumentInput{})
 	if err != nil {
 		emd.logger.Error("Failed to get ec2 metadata", zap.Error(err))
 		return
 	}
 
-	emd.instanceID = doc.InstanceID
-	emd.instanceType = doc.InstanceType
-	emd.region = doc.Region
-	emd.instanceIP = doc.PrivateIP
+	emd.instanceID = resp.InstanceID
+	emd.instanceType = resp.InstanceType
+	emd.region = resp.Region
+	emd.instanceIP = resp.PrivateIP
 
 	// notify ec2tags and ebsvolume that the instance id is ready
 	if emd.instanceID != "" {

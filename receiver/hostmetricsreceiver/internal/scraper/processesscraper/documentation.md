@@ -2,19 +2,34 @@
 
 # processes
 
-## Metrics
+## Default Metrics
 
-These are the metrics available for this scraper.
+The following metrics are emitted by default. Each of them can be disabled by applying the following configuration:
 
-| Name | Description | Unit | Type | Attributes |
-| ---- | ----------- | ---- | ---- | ---------- |
-| **system.processes.count** | Total number of processes in each state. | {processes} | Sum(Int) | <ul> <li>status</li> </ul> |
-| **system.processes.created** | Total number of created processes. | {processes} | Sum(Int) | <ul> </ul> |
+```yaml
+metrics:
+  <metric_name>:
+    enabled: false
+```
 
-**Highlighted metrics** are emitted by default.
+### system.processes.count
 
-## Attributes
+Total number of processes in each state.
 
-| Name | Description |
-| ---- | ----------- |
-| status | Breakdown status of the processes. |
+| Unit | Metric Type | Value Type | Aggregation Temporality | Monotonic |
+| ---- | ----------- | ---------- | ----------------------- | --------- |
+| {processes} | Sum | Int | Cumulative | false |
+
+#### Attributes
+
+| Name | Description | Values |
+| ---- | ----------- | ------ |
+| status | Breakdown status of the processes. | Str: ``blocked``, ``daemon``, ``detached``, ``idle``, ``locked``, ``orphan``, ``paging``, ``running``, ``sleeping``, ``stopped``, ``system``, ``unknown``, ``zombies`` |
+
+### system.processes.created
+
+Total number of created processes.
+
+| Unit | Metric Type | Value Type | Aggregation Temporality | Monotonic |
+| ---- | ----------- | ---------- | ----------------------- | --------- |
+| {processes} | Sum | Int | Cumulative | true |

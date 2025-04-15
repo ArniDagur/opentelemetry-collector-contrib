@@ -1,0 +1,10 @@
+type: status
+
+status:
+  class: pkg
+  stability:
+    development: [extension]
+  codeowners:
+    active: [mwear]
+    emeritus: [jpkrohling]
+    seeking_new: true

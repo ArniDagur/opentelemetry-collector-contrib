@@ -1,22 +1,12 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package splunk
 
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"testing"
 	"time"
@@ -64,6 +54,9 @@ func TestConsumeMetrics(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resp := &http.Response{
+				Request: &http.Request{
+					URL: &url.URL{Scheme: "http", Host: "splunk.com", Path: "/endpoint"},
+				},
 				StatusCode: tt.httpResponseCode,
 			}
 			if tt.retryAfter != 0 {
@@ -85,9 +78,9 @@ func TestConsumeMetrics(t *testing.T) {
 			}
 
 			if tt.wantThrottleErr {
-				expected := fmt.Errorf("HTTP %d %q", tt.httpResponseCode, http.StatusText(tt.httpResponseCode))
+				expected := fmt.Errorf("HTTP \"/endpoint\" %d %q", tt.httpResponseCode, http.StatusText(tt.httpResponseCode))
 				expected = exporterhelper.NewThrottleRetry(expected, time.Duration(tt.retryAfter)*time.Second)
-				assert.EqualValues(t, expected, err)
+				assert.Equal(t, expected, err)
 				return
 			}
 

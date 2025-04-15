@@ -1,147 +1,114 @@
-// Copyright  The OpenTelemetry Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package kafkaexporter
 
 import (
-	"encoding/json"
-	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/model/pdata"
-	semconv "go.opentelemetry.io/collector/model/semconv/v1.6.1"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/kafkaexporter/internal/marshaler"
 )
 
-func TestDefaultTracesMarshalers(t *testing.T) {
-	expectedEncodings := []string{
-		"otlp_proto",
-		"otlp_json",
-		"jaeger_proto",
-		"jaeger_json",
-	}
-	marshalers := tracesMarshalers()
-	assert.Equal(t, len(expectedEncodings), len(marshalers))
-	for _, e := range expectedEncodings {
-		t.Run(e, func(t *testing.T) {
-			m, ok := marshalers[e]
-			require.True(t, ok)
-			assert.NotNil(t, m)
-		})
-	}
+func TestGetLogsMarshaler(t *testing.T) {
+	// Verify built-in marshalers.
+	_ = mustGetLogsMarshaler(t, "otlp_proto", componenttest.NewNopHost())
+	_ = mustGetLogsMarshaler(t, "otlp_json", componenttest.NewNopHost())
+	_ = mustGetLogsMarshaler(t, "raw", componenttest.NewNopHost())
+
+	// Verify extensions take precedence over built-in marshalers.
+	m := mustGetLogsMarshaler(t, "otlp_proto", extensionsHost{
+		component.MustNewID("otlp_proto"): plogMarshalerFuncExtension(func(plog.Logs) ([]byte, error) {
+			return []byte("overridden"), nil
+		}),
+	})
+	messages, err := m.MarshalLogs(plog.NewLogs())
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "overridden", string(messages[0].Value))
+
+	// Specifying an extension for a different type should fail fast.
+	m, err = getLogsMarshaler("otlp_proto", extensionsHost{
+		component.MustNewID("otlp_proto"): struct{ component.Component }{},
+	})
+	require.EqualError(t, err, `extension "otlp_proto" is not a logs marshaler`)
+	assert.Nil(t, m)
 }
 
-func TestDefaultMetricsMarshalers(t *testing.T) {
-	expectedEncodings := []string{
-		"otlp_proto",
-		"otlp_json",
-	}
-	marshalers := metricsMarshalers()
-	assert.Equal(t, len(expectedEncodings), len(marshalers))
-	for _, e := range expectedEncodings {
-		t.Run(e, func(t *testing.T) {
-			m, ok := marshalers[e]
-			require.True(t, ok)
-			assert.NotNil(t, m)
-		})
-	}
+func TestGetMetricsMarshaler(t *testing.T) {
+	// Verify a built-in marshaler.
+	_ = mustGetMetricsMarshaler(t, "otlp_proto", componenttest.NewNopHost())
+
+	// Verify extensions take precedence over built-in marshalers.
+	m := mustGetMetricsMarshaler(t, "otlp_proto", extensionsHost{
+		component.MustNewID("otlp_proto"): pmetricMarshalerFuncExtension(func(pmetric.Metrics) ([]byte, error) {
+			return []byte("overridden"), nil
+		}),
+	})
+	messages, err := m.MarshalMetrics(pmetric.NewMetrics())
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "overridden", string(messages[0].Value))
+
+	// Specifying an extension for a different type should fail fast.
+	m, err = getMetricsMarshaler("otlp_proto", extensionsHost{
+		component.MustNewID("otlp_proto"): struct{ component.Component }{},
+	})
+	require.EqualError(t, err, `extension "otlp_proto" is not a metrics marshaler`)
+	assert.Nil(t, m)
 }
 
-func TestDefaultLogsMarshalers(t *testing.T) {
-	expectedEncodings := []string{
-		"otlp_proto",
-		"otlp_json",
-	}
-	marshalers := logsMarshalers()
-	assert.Equal(t, len(expectedEncodings), len(marshalers))
-	for _, e := range expectedEncodings {
-		t.Run(e, func(t *testing.T) {
-			m, ok := marshalers[e]
-			require.True(t, ok)
-			assert.NotNil(t, m)
-		})
-	}
+func TestGetTracesMarshaler(t *testing.T) {
+	// Verify a built-in marshaler.
+	_ = mustGetTracesMarshaler(t, "otlp_proto", componenttest.NewNopHost())
+	_ = mustGetTracesMarshaler(t, "jaeger_proto", componenttest.NewNopHost())
+	_ = mustGetTracesMarshaler(t, "jaeger_json", componenttest.NewNopHost())
+	_ = mustGetTracesMarshaler(t, "zipkin_proto", componenttest.NewNopHost())
+	_ = mustGetTracesMarshaler(t, "zipkin_json", componenttest.NewNopHost())
+
+	// Verify extensions take precedence over built-in marshalers.
+	m := mustGetTracesMarshaler(t, "otlp_proto", extensionsHost{
+		component.MustNewID("otlp_proto"): ptraceMarshalerFuncExtension(func(ptrace.Traces) ([]byte, error) {
+			return []byte("overridden"), nil
+		}),
+	})
+	messages, err := m.MarshalTraces(ptrace.NewTraces())
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "overridden", string(messages[0].Value))
+
+	// Specifying an extension for a different type should fail fast.
+	m, err = getTracesMarshaler("otlp_proto", extensionsHost{
+		component.MustNewID("otlp_proto"): struct{ component.Component }{},
+	})
+	require.EqualError(t, err, `extension "otlp_proto" is not a traces marshaler`)
+	assert.Nil(t, m)
 }
 
-func TestOTLPTracesJsonMarshaling(t *testing.T) {
-	t.Parallel()
+func mustGetLogsMarshaler(tb testing.TB, encoding string, host component.Host) marshaler.LogsMarshaler {
+	tb.Helper()
+	m, err := getLogsMarshaler(encoding, host)
+	require.NoError(tb, err)
+	return m
+}
 
-	now := time.Unix(1, 0)
+func mustGetMetricsMarshaler(tb testing.TB, encoding string, host component.Host) marshaler.MetricsMarshaler {
+	tb.Helper()
+	m, err := getMetricsMarshaler(encoding, host)
+	require.NoError(tb, err)
+	return m
+}
 
-	traces := pdata.NewTraces()
-	traces.ResourceSpans().AppendEmpty()
-
-	rs := traces.ResourceSpans().At(0)
-	rs.SetSchemaUrl(semconv.SchemaURL)
-	rs.InstrumentationLibrarySpans().AppendEmpty()
-
-	ils := rs.InstrumentationLibrarySpans().At(0)
-	ils.SetSchemaUrl(semconv.SchemaURL)
-	ils.Spans().AppendEmpty()
-
-	span := ils.Spans().At(0)
-	span.SetKind(pdata.SpanKindInternal)
-	span.SetName(t.Name())
-	span.SetStartTimestamp(pdata.NewTimestampFromTime(now))
-	span.SetEndTimestamp(pdata.NewTimestampFromTime(now.Add(time.Second)))
-	span.SetSpanID(pdata.NewSpanID([8]byte{0, 1, 2, 3, 4, 5, 6, 7}))
-	span.SetParentSpanID(pdata.NewSpanID([8]byte{8, 9, 10, 11, 12, 13, 14}))
-
-	marshaler, ok := tracesMarshalers()["otlp_json"]
-	require.True(t, ok, "Must have otlp json marshaller")
-
-	msg, err := marshaler.Marshal(traces, t.Name())
-	require.NoError(t, err, "Must have marshaled the data without error")
-	require.Len(t, msg, 1, "Must have one entry in the message")
-
-	data, err := msg[0].Value.Encode()
-	require.NoError(t, err, "Must not error when encoding value")
-	require.NotNil(t, data, "Must have valid data to test")
-
-	// Since marshaling json is not guaranteed to be in order
-	// within a string, using a map to compare that the expected values are there
-	expectedJSON := map[string]interface{}{
-		"resourceSpans": []interface{}{
-			map[string]interface{}{
-				"resource": map[string]interface{}{},
-				"instrumentationLibrarySpans": []interface{}{
-					map[string]interface{}{
-						"instrumentationLibrary": map[string]interface{}{},
-						"spans": []interface{}{
-							map[string]interface{}{
-								"traceId":           "",
-								"spanId":            "0001020304050607",
-								"parentSpanId":      "08090a0b0c0d0e00",
-								"name":              t.Name(),
-								"kind":              pdata.SpanKindInternal.String(),
-								"startTimeUnixNano": fmt.Sprint(now.UnixNano()),
-								"endTimeUnixNano":   fmt.Sprint(now.Add(time.Second).UnixNano()),
-								"status":            map[string]interface{}{},
-							},
-						},
-						"schemaUrl": semconv.SchemaURL,
-					},
-				},
-				"schemaUrl": semconv.SchemaURL,
-			},
-		},
-	}
-
-	var final map[string]interface{}
-	err = json.Unmarshal(data, &final)
-	require.NoError(t, err, "Must not error marshaling expected data")
-
-	assert.Equal(t, expectedJSON, final, "Must match the expected value")
+func mustGetTracesMarshaler(tb testing.TB, encoding string, host component.Host) marshaler.TracesMarshaler {
+	tb.Helper()
+	m, err := getTracesMarshaler(encoding, host)
+	require.NoError(tb, err)
+	return m
 }

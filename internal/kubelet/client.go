@@ -1,16 +1,5 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package kubelet // import "github.com/open-telemetry/opentelemetry-collector-contrib/internal/kubelet"
 
@@ -18,12 +7,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
 	"go.uber.org/zap"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/transport"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/common/sanitize"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/k8sconfig"
@@ -41,7 +33,7 @@ type Client interface {
 }
 
 func NewClientProvider(endpoint string, cfg *ClientConfig, logger *zap.Logger) (ClientProvider, error) {
-	switch cfg.APIConfig.AuthType {
+	switch cfg.AuthType {
 	case k8sconfig.AuthTypeTLS:
 		return &tlsClientProvider{
 			endpoint: endpoint,
@@ -52,6 +44,7 @@ func NewClientProvider(endpoint string, cfg *ClientConfig, logger *zap.Logger) (
 		return &saClientProvider{
 			endpoint:   endpoint,
 			caCertPath: svcAcctCACertPath,
+			cfg:        cfg,
 			tokenPath:  svcAcctTokenPath,
 			logger:     logger,
 		}, nil
@@ -60,13 +53,54 @@ func NewClientProvider(endpoint string, cfg *ClientConfig, logger *zap.Logger) (
 			endpoint: endpoint,
 			logger:   logger,
 		}, nil
+	case k8sconfig.AuthTypeKubeConfig:
+		return &kubeConfigClientProvider{
+			endpoint: endpoint,
+			cfg:      cfg,
+			logger:   logger,
+		}, nil
 	default:
-		return nil, fmt.Errorf("AuthType [%s] not supported", cfg.APIConfig.AuthType)
+		return nil, fmt.Errorf("AuthType [%s] not supported", cfg.AuthType)
 	}
 }
 
 type ClientProvider interface {
 	BuildClient() (Client, error)
+}
+
+type kubeConfigClientProvider struct {
+	endpoint string
+	cfg      *ClientConfig
+	logger   *zap.Logger
+}
+
+func (p *kubeConfigClientProvider) BuildClient() (Client, error) {
+	authConf, err := k8sconfig.CreateRestConfig(p.cfg.APIConfig)
+	if err != nil {
+		return nil, err
+	}
+	if p.cfg.InsecureSkipVerify {
+		// Override InsecureSkipVerify from kubeconfig
+		authConf.CAFile = ""
+		authConf.CAData = nil
+		authConf.Insecure = true
+	}
+
+	client, err := rest.HTTPClientFor(authConf)
+	if err != nil {
+		return nil, err
+	}
+
+	joinPath, err := url.JoinPath(authConf.Host, "/api/v1/nodes/", p.endpoint, "/proxy/")
+	if err != nil {
+		return nil, err
+	}
+	return &clientImpl{
+		baseURL:    joinPath,
+		httpClient: *client,
+		tok:        nil,
+		logger:     p.logger,
+	}, nil
 }
 
 type readOnlyClientProvider struct {
@@ -86,7 +120,6 @@ func (p *readOnlyClientProvider) BuildClient() (Client, error) {
 		tok:        nil,
 		logger:     p.logger,
 	}, nil
-
 }
 
 type tlsClientProvider struct {
@@ -117,24 +150,46 @@ func (p *tlsClientProvider) BuildClient() (Client, error) {
 type saClientProvider struct {
 	endpoint   string
 	caCertPath string
+	cfg        *ClientConfig
 	tokenPath  string
 	logger     *zap.Logger
 }
 
 func (p *saClientProvider) BuildClient() (Client, error) {
-	rootCAs, err := systemCertPoolPlusPath(p.caCertPath)
+	caCertPath := p.caCertPath
+	if p.cfg.CAFile != "" {
+		caCertPath = p.cfg.CAFile
+	}
+	rootCAs, err := systemCertPoolPlusPath(caCertPath)
 	if err != nil {
 		return nil, err
 	}
-	tok, err := ioutil.ReadFile(p.tokenPath)
+	tok, err := os.ReadFile(p.tokenPath)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read token file %s: %w", p.tokenPath, err)
 	}
 	tr := defaultTransport()
 	tr.TLSClientConfig = &tls.Config{
-		RootCAs: rootCAs,
+		RootCAs:            rootCAs,
+		InsecureSkipVerify: p.cfg.InsecureSkipVerify,
 	}
-	return defaultTLSClient(p.endpoint, true, rootCAs, nil, tok, p.logger)
+	endpoint, err := buildEndpoint(p.endpoint, true, p.logger)
+	if err != nil {
+		return nil, err
+	}
+	rt, err := transport.NewBearerAuthWithRefreshRoundTripper(string(tok), p.tokenPath, tr)
+	if err != nil {
+		return nil, err
+	}
+
+	return &clientImpl{
+		baseURL: endpoint,
+		httpClient: http.Client{
+			Transport: rt,
+		},
+		tok:    nil,
+		logger: p.logger,
+	}, nil
 }
 
 func defaultTLSClient(
@@ -225,7 +280,7 @@ func (c *clientImpl) Get(path string) ([]byte, error) {
 		}
 	}()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Kubelet response body: %w", err)
 	}
@@ -238,9 +293,12 @@ func (c *clientImpl) Get(path string) ([]byte, error) {
 	return body, nil
 }
 
-func (c *clientImpl) buildReq(path string) (*http.Request, error) {
-	url := c.baseURL + path
-	req, err := http.NewRequest("GET", url, nil)
+func (c *clientImpl) buildReq(p string) (*http.Request, error) {
+	reqURL, err := url.JoinPath(c.baseURL, p)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
